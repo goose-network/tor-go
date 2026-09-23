@@ -1,0 +1,10 @@
+# Compiled binaries
+/tor-go
+/bin/
+
+# Test artifacts
+*.out
+*.test
+
+# Dependency directories (kept via go.mod/go.sum)
+/vendor/
