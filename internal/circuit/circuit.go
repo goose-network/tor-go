@@ -151,6 +151,11 @@ type Stream struct {
 	in      chan *torcell.RelayCell
 	closed  bool
 
+	// BoundAddr is the address the exit bound the stream to, parsed from the
+	// RELAY_CONNECTED reply (an IPv4 or IPv6 literal). Empty until the stream
+	// is connected, or if the exit sent an empty CONNECTED.
+	BoundAddr string
+
 	// Stream-level flow control, guarded by circ.mu.
 	packageWindow int
 	deliverWindow int
@@ -830,9 +835,21 @@ func (c *Circuit) OpenStream(ctx context.Context, target string) (*Stream, error
 	c.streams[id] = s
 	c.mu.Unlock()
 
-	// RELAY_BEGIN payload: "host:port\0" followed by optional flags. We send
-	// the basic form (no IPv6 / hostname flags), matching the common case.
+	// RELAY_BEGIN payload: "host:port\0" followed by an optional 4-byte
+	// big-endian flags field (connection_edge.h:242). We set:
+	//   - BEGIN_FLAG_IPV6_OK (1) for any target, so the exit may connect over
+	//     IPv6 when the target resolves to one;
+	//   - BEGIN_FLAG_IPV4_NOT_OK (2) when the target is an IPv6 literal, since
+	//     it cannot be reached over IPv4.
+	// For an IPv4 literal or a hostname we leave IPv4 allowed (the common
+	// case), so the flags field is just IPV6_OK.
 	beginPayload := append([]byte(target), 0)
+	var flags uint32 = beginFlagIPv6OK
+	if host, isV6 := targetHost(target); isV6 || (netParseIP(host) != nil && netParseIP(host).To4() == nil) {
+		// target is an IPv6 literal: it cannot be reached over IPv4.
+		flags |= beginFlagIPv4NotOK
+	}
+	beginPayload = binary.BigEndian.AppendUint32(beginPayload, flags)
 	if err := c.sendRelay(ctx, torcell.RelayBegin, id, beginPayload, false); err != nil {
 		c.removeStream(id)
 		return nil, err
@@ -847,6 +864,7 @@ func (c *Circuit) OpenStream(ctx context.Context, target string) (*Stream, error
 		select {
 		case rc := <-s.in:
 			if rc.Header.Command == torcell.RelayConnected {
+				s.BoundAddr = parseConnected(rc.Payload)
 				return s, nil
 			}
 			if rc.Header.Command == torcell.RelayEnd {
@@ -993,6 +1011,7 @@ func (c *Circuit) BeginDir(ctx context.Context) (*Stream, error) {
 		select {
 		case rc := <-s.in:
 			if rc.Header.Command == torcell.RelayConnected {
+				s.BoundAddr = parseConnected(rc.Payload)
 				return s, nil
 			}
 			if rc.Header.Command == torcell.RelayEnd {
@@ -1195,4 +1214,69 @@ func parsePort(addr string) uint16 {
 		}
 	}
 	return 0
+}
+
+// BEGIN_FLAG_* flags carried in the RELAY_BEGIN payload after the NUL
+// terminator (connection_edge.h:242-250).
+const (
+	beginFlagIPv6OK        uint32 = 1 << 0 // the exit may connect over IPv6
+	beginFlagIPv4NotOK     uint32 = 1 << 1 // the exit must not connect over IPv4
+	beginFlagIPv6Preferred uint32 = 1 << 2 // prefer IPv6 when both are possible
+)
+
+// targetHost extracts the host part of a "host:port" target, handling
+// bracketed IPv6 literals (e.g. "[::1]:443" -> "::1"). It returns the host
+// and whether the host is an IPv6 literal.
+func targetHost(target string) (host string, isV6Literal bool) {
+	if len(target) > 0 && target[0] == '[' {
+		// Bracketed IPv6 literal: [addr]:port.
+		if i := stringsIndex(target, "]"); i > 0 {
+			return target[1:i], true
+		}
+	}
+	// Plain host:port (IPv4 or hostname). Split at the last ':'.
+	for i := len(target) - 1; i >= 0; i-- {
+		if target[i] == ':' {
+			return target[:i], false
+		}
+	}
+	return target, false
+}
+
+// stringsIndex returns the index of the first occurrence of b in s, or -1.
+func stringsIndex(s, b string) int {
+	for i := 0; i+len(b) <= len(s); i++ {
+		if s[i:i+len(b)] == b {
+			return i
+		}
+	}
+	return -1
+}
+
+// parseConnected parses the bound address from a RELAY_CONNECTED payload
+// (relay.c:1115 connected_cell_parse). The format is:
+//   - empty payload: no address (returns "");
+//   - 4-byte IPv4 (big-endian) [+ 4-byte TTL];
+//   - 4 zero bytes + type 6 + 16-byte IPv6 + 4-byte TTL.
+// It returns the address as a string ("1.2.3.4" or "::1") and ignores the
+// TTL. A malformed payload yields an empty string (the stream is still
+// considered connected; the address is best-effort).
+func parseConnected(payload []byte) string {
+	if len(payload) == 0 {
+		return ""
+	}
+	if len(payload) < 4 {
+		return ""
+	}
+	first := binary.BigEndian.Uint32(payload[0:4])
+	if first != 0 {
+		// IPv4 address.
+		return net.IPv4(byte(first>>24), byte(first>>16), byte(first>>8), byte(first)).String()
+	}
+	// IPv6: 4 zero bytes + type(6) + 16 bytes + 4 bytes TTL.
+	if len(payload) < 25 || payload[4] != 6 {
+		return ""
+	}
+	ip := net.IP(append([]byte(nil), payload[5:21]...))
+	return ip.String()
 }

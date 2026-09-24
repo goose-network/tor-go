@@ -564,8 +564,11 @@ type extendResult struct {
 // start piping data. Only the exit relay does this (it has no prevHop that
 // would forward further).
 func (r *MockRelay) handleBegin(codec *torcell.Codec, rc *relayCircuit, streamID uint16, payload []byte) {
-	// payload is "host:port\0".
-	target := string(bytes.TrimRight(payload, "\x00"))
+	// payload is "host:port\0" optionally followed by a 4-byte flags field.
+	// The target is everything up to the first NUL; the flags (if any) are
+	// ignored by the exit beyond IPv4/IPv6 reachability, which the mock does
+	// not enforce.
+	target := beginTarget(payload)
 	d := &net.Dialer{Timeout: 10 * time.Second}
 	conn, err := d.Dial("tcp", target)
 	if err != nil {
@@ -577,11 +580,38 @@ func (r *MockRelay) handleBegin(codec *torcell.Codec, rc *relayCircuit, streamID
 	rc.mu.Lock()
 	rc.streams[streamID] = &relayStream{conn: conn, circ: rc, streamID: streamID}
 	rc.mu.Unlock()
-	// Send RELAY_CONNECTED with a zero IPv4 bind address.
-	connected := []byte{0x04, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00}
+	// Send RELAY_CONNECTED with the bound IPv4 address (4 bytes, big-endian)
+	// and a zero TTL, matching connected_cell_format. We report the actual
+	// dialed address so the client's parseConnected has a real value.
+	connected := connectedPayload(conn.LocalAddr())
 	r.sendRelayBackward(codec, rc, streamID, torcell.RelayConnected, connected)
 	// Start reading from the target and sending RELAY_DATA back.
 	go r.pipeFromTarget(codec, rc, streamID, conn)
+}
+
+// beginTarget extracts the "host:port" target from a RELAY_BEGIN payload,
+// which is "host:port\0" optionally followed by a 4-byte flags field. It
+// returns the bytes up to the first NUL.
+func beginTarget(payload []byte) string {
+	for i, b := range payload {
+		if b == 0 {
+			return string(payload[:i])
+		}
+	}
+	return string(payload)
+}
+
+// connectedPayload builds a RELAY_CONNECTED payload for the given local
+// address: a 4-byte big-endian IPv4 address followed by a 4-byte zero TTL.
+// For a non-IPv4 address it returns a zero IPv4 address (the client treats
+// an all-zero first word as "no address").
+func connectedPayload(localAddr net.Addr) []byte {
+	host, _, _ := net.SplitHostPort(localAddr.String())
+	ip := net.ParseIP(host)
+	if v4 := ip.To4(); v4 != nil {
+		return []byte{v4[0], v4[1], v4[2], v4[3], 0, 0, 0, 0}
+	}
+	return []byte{0, 0, 0, 0, 0, 0, 0, 0}
 }
 
 // pipeFromTarget reads from the target TCP connection and sends RELAY_DATA
