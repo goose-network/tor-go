@@ -4,6 +4,7 @@ import (
 	"crypto/sha256"
 	"encoding/base64"
 	"testing"
+	"time"
 )
 
 func TestParseConsensus(t *testing.T) {
@@ -120,5 +121,41 @@ func TestMockDirectory(t *testing.T) {
 		if r.Address == "" {
 			t.Fatalf("relay %s has empty address", r.Nickname)
 		}
+	}
+}
+
+func TestParseConsensusMeta(t *testing.T) {
+	text := []byte("network-status-version 3 microdesc\n" +
+		"vote-status consensus\n" +
+		"valid-after 2026-09-24 00:00:00\n" +
+		"fresh-until 2026-09-24 01:00:00\n" +
+		"valid-until 2026-09-24 03:00:00\n" +
+		"directory-footer\n")
+	meta, err := ParseConsensusMeta(text)
+	if err != nil {
+		t.Fatal(err)
+	}
+	wantVA := time.Date(2026, 9, 24, 0, 0, 0, 0, time.UTC)
+	wantFU := time.Date(2026, 9, 24, 1, 0, 0, 0, time.UTC)
+	wantVU := time.Date(2026, 9, 24, 3, 0, 0, 0, time.UTC)
+	// time.Parse defaults to UTC.
+	if !meta.ValidAfter.Equal(wantVA) {
+		t.Errorf("ValidAfter = %v, want %v", meta.ValidAfter, wantVA)
+	}
+	if !meta.FreshUntil.Equal(wantFU) {
+		t.Errorf("FreshUntil = %v, want %v", meta.FreshUntil, wantFU)
+	}
+	if !meta.ValidUntil.Equal(wantVU) {
+		t.Errorf("ValidUntil = %v, want %v", meta.ValidUntil, wantVU)
+	}
+}
+
+func TestParseConsensusMetaMissing(t *testing.T) {
+	// No fresh-until line.
+	text := []byte("network-status-version 3 microdesc\n" +
+		"valid-after 2026-09-24 00:00:00\n" +
+		"valid-until 2026-09-24 03:00:00\n")
+	if _, err := ParseConsensusMeta(text); err == nil {
+		t.Fatal("expected error for missing fresh-until")
 	}
 }

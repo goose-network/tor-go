@@ -50,6 +50,10 @@ const (
 	STREAMWINDOW_START = 500
 	// STREAMWINDOW_INCREMENT is the number of cells a stream-level SENDME refills.
 	STREAMWINDOW_INCREMENT = 50
+	// MaxRelayEarlyCellsPerCircuit caps the number of RELAY_EARLY cells an
+	// origin circuit may send, matching MAX_RELAY_EARLY_CELLS_PER_CIRCUIT
+	// (or.h:935). Prevents malicious-extension attacks (command.c:548).
+	MaxRelayEarlyCellsPerCircuit = 8
 )
 
 // Relay END reasons (subset), matching src/core/or/or.h (END_STREAM_REASON_*).
@@ -123,6 +127,14 @@ type Circuit struct {
 	// guarded by mu.
 	packageWindow int
 	deliverWindow int
+
+	// remainingRelayEarly is the number of RELAY_EARLY cells we may still
+	// send on this circuit. Tor caps this at MAX_RELAY_EARLY_CELLS_PER_CIRCUIT
+	// (8) to prevent a class of attacks where a malicious exit forwards
+	// RELAY_EARLY cells to extend the circuit further than the path length
+	// allows (command.c:548). Each EXTEND2 consumes one; once exhausted,
+	// further extends are refused. Guarded by mu.
+	remainingRelayEarly int
 }
 
 // Stream is an application stream multiplexed over a circuit.
@@ -150,14 +162,15 @@ func New(ctx context.Context, l *link.Link, path []link.RouterIdentity) (*Circui
 		return nil, err
 	}
 	c := &Circuit{
-		link:          l,
-		circID:        circID,
-		in:            in,
-		streams:       make(map[uint16]*Stream),
-		nextStream:    1,
-		done:          make(chan struct{}),
-		packageWindow: CIRCWINDOW_START,
-		deliverWindow: CIRCWINDOW_START,
+		link:               l,
+		circID:             circID,
+		in:                 in,
+		streams:            make(map[uint16]*Stream),
+		nextStream:         1,
+		done:               make(chan struct{}),
+		packageWindow:      CIRCWINDOW_START,
+		deliverWindow:      CIRCWINDOW_START,
+		remainingRelayEarly: MaxRelayEarlyCellsPerCircuit,
 	}
 	c.hops = make([]*Hop, len(path))
 	for i, r := range path {
@@ -389,6 +402,19 @@ func (c *Circuit) sendRelay(ctx context.Context, command uint8, streamID uint16,
 
 	cmd := uint8(torcell.CellRelay)
 	if early {
+		// Enforce the per-circuit RELAY_EARLY cap. Once exhausted, refuse to
+		// send further RELAY_EARLY cells (the C client does the same at
+		// relay.c:674 — it simply stops marking cells early; for an origin
+		// client building a path, exhausting the cap means we can't extend
+		// further, so we fail rather than silently downgrading to RELAY,
+		// which the next hop would reject as an unexpected extend).
+		c.mu.Lock()
+		if c.remainingRelayEarly <= 0 {
+			c.mu.Unlock()
+			return errors.New("circuit: relay-early cell limit exhausted")
+		}
+		c.remainingRelayEarly--
+		c.mu.Unlock()
 		cmd = torcell.CellRelayEarly
 	}
 	cell := &torcell.Cell{

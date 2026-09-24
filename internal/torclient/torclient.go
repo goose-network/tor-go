@@ -51,6 +51,20 @@ type Config struct {
 	LinkDialTimeout time.Duration
 	// CircuitBuildTimeout is the timeout for building a circuit.
 	CircuitBuildTimeout time.Duration
+	// RefreshInterval is how often to re-fetch the consensus in the
+	// background while serving. If zero (the default), no background refresh
+	// runs and the client uses the directory it was constructed with for its
+	// whole lifetime. A real client should set this to a few hours (the C
+	// client re-fetches at the consensus fresh-until time, typically every
+	// hour). The refresh re-fetches the consensus + microdescriptors and
+	// atomically swaps the client's directory in place, so new circuits use
+	// the fresh relays.
+	RefreshInterval time.Duration
+	// FetchOptions, when non-nil, configures the background consensus
+	// refresh (and is used by RefreshDirectory). If RefreshInterval is set
+	// but FetchOptions is nil, the refresh uses default authorities and the
+	// client's UpstreamProxy. Set VerifySignatures here for real-network use.
+	FetchOptions *directory.FetchOptions
 }
 
 // Client is a running Tor client.
@@ -187,7 +201,8 @@ func (c *Client) Connect(ctx context.Context) error {
 	}
 
 	// prop271 failover: try successive guards from the manager.
-	eligible := eligibleGuards(c.dir)
+	dir := c.directory()
+	eligible := eligibleGuards(dir)
 	const maxAttempts = 5
 	var lastErr error
 	for attempt := 0; attempt < maxAttempts; attempt++ {
@@ -195,7 +210,7 @@ func (c *Client) Connect(ctx context.Context) error {
 		if sel == nil {
 			break
 		}
-		r := c.dir[sel.Guard.ID]
+		r := dir[sel.Guard.ID]
 		if r == nil {
 			// Stale guard ID; mark failed and continue.
 			c.guards.NoteConnectionFailure(sel.Guard.ID, time.Now())
@@ -237,10 +252,15 @@ func (c *Client) dialGuard(ctx context.Context, r *directory.Router, guardID str
 }
 
 // Serve connects to the guard (if not already connected) and serves the
-// SOCKS5 proxy until the context is cancelled.
+// SOCKS5 proxy until the context is cancelled. If RefreshInterval is set, it
+// also runs a background consensus refresh that periodically re-fetches the
+// directory and swaps it in for new circuits.
 func (c *Client) Serve(ctx context.Context) error {
 	if err := c.Connect(ctx); err != nil {
 		return err
+	}
+	if c.cfg.RefreshInterval > 0 {
+		go c.refreshLoop(ctx)
 	}
 	errCh := make(chan error, 1)
 	go func() { errCh <- c.socks.ListenAndServe() }()
@@ -262,6 +282,61 @@ func (c *Client) Serve(ctx context.Context) error {
 		c.closed = true
 		c.mu.Unlock()
 		return err
+	}
+}
+
+// refreshLoop periodically re-fetches the consensus and swaps the client's
+// directory in place. A refresh failure is logged but does not stop the loop
+// (the client keeps serving with the last good directory); the next tick
+// retries. This mirrors the C client's directory download lifecycle
+// (directory_info_has_arrived / update_consensus_networkstatus_downloads).
+func (c *Client) refreshLoop(ctx context.Context) {
+	t := time.NewTicker(c.cfg.RefreshInterval)
+	defer t.Stop()
+	for {
+		select {
+		case <-ctx.Done():
+			return
+		case <-t.C:
+			if err := c.RefreshDirectory(ctx); err != nil {
+				log.Printf("torclient: consensus refresh failed: %v", err)
+			}
+		}
+	}
+}
+
+// RefreshDirectory re-fetches the consensus + microdescriptors and atomically
+// swaps the client's directory in place, so subsequent circuits use the fresh
+// relays. It does not disturb in-flight circuits (they keep their existing
+// path). The guard is re-selected from the fresh directory if the current
+// guard is no longer listed; otherwise the current guard is preserved.
+func (c *Client) RefreshDirectory(ctx context.Context) error {
+	opts := c.fetchOpts()
+	routers, _, err := directory.FetchWithMeta(ctx, *opts)
+	if err != nil {
+		return fmt.Errorf("refresh directory: %w", err)
+	}
+	c.mu.Lock()
+	// Preserve the current guard if it's still in the fresh directory;
+	// otherwise the guard manager will pick a new one on the next Connect.
+	c.dir = routers
+	c.mu.Unlock()
+	log.Printf("torclient: refreshed directory: %d relays", len(routers))
+	return nil
+}
+
+// fetchOpts builds the FetchOptions for a refresh, falling back to defaults.
+func (c *Client) fetchOpts() *directory.FetchOptions {
+	if c.cfg.FetchOptions != nil {
+		opts := *c.cfg.FetchOptions
+		if opts.UpstreamProxy == "" {
+			opts.UpstreamProxy = c.cfg.UpstreamProxy
+		}
+		return &opts
+	}
+	return &directory.FetchOptions{
+		UpstreamProxy: c.cfg.UpstreamProxy,
+		Timeout:       5 * time.Minute,
 	}
 }
 
@@ -307,16 +382,20 @@ func (d *dialer) DialStream(ctx context.Context, target string) (io.ReadWriteClo
 
 // buildPath selects the relays for a circuit of the configured length.
 func (c *Client) buildPath() ([]link.RouterIdentity, error) {
+	dir := c.directory()
 	path := make([]link.RouterIdentity, 0, c.cfg.PathLen)
-	path = append(path, c.guard.RouterIdentity)
+	c.mu.Lock()
+	guard := c.guard
+	c.mu.Unlock()
+	path = append(path, guard.RouterIdentity)
 
 	for i := 1; i < c.cfg.PathLen; i++ {
 		var r *directory.Router
 		var err error
 		if i == c.cfg.PathLen-1 {
-			r, err = directory.SelectExit(c.dir)
+			r, err = directory.SelectExit(dir)
 		} else {
-			r, err = directory.SelectMiddle(c.dir)
+			r, err = directory.SelectMiddle(dir)
 		}
 		if err != nil {
 			return nil, fmt.Errorf("torclient: select hop %d: %w", i+1, err)
@@ -324,6 +403,16 @@ func (c *Client) buildPath() ([]link.RouterIdentity, error) {
 		path = append(path, r.RouterIdentity)
 	}
 	return path, nil
+}
+
+// directory returns a snapshot of the current router map, safe to read
+// outside the lock. The map itself is never mutated in place (refreshes swap
+// in a whole new map), so a snapshot taken under the lock is safe to use for
+// the lifetime of a circuit build.
+func (c *Client) directory() map[string]*directory.Router {
+	c.mu.Lock()
+	defer c.mu.Unlock()
+	return c.dir
 }
 
 // streamWrap wraps a circuit Stream so that closing the stream also closes

@@ -93,6 +93,13 @@ type FetchOptions struct {
 	// (the default, for backward compatibility with tests that mint their
 	// own consensus), the consensus is accepted without a signature check.
 	VerifySignatures bool
+	// Retries is the number of times to retry the consensus fetch across all
+	// authorities before giving up. If zero, each authority is tried once
+	// (the legacy behavior). Retries use exponential backoff with jitter
+	// (1s, 2s, 4s, ... capped at 30s), mirroring the C client's
+	// download_status failure schedule. The overall Timeout still bounds
+	// the total attempt time.
+	Retries int
 }
 
 // Fetch downloads a real microconsensus and its microdescriptors, parses them,
@@ -103,6 +110,14 @@ type FetchOptions struct {
 // This requires outbound connectivity (directly or via UpstreamProxy) to the
 // directory sources; it returns an error if none are reachable.
 func Fetch(ctx context.Context, opts FetchOptions) (map[string]*Router, error) {
+	routers, _, err := FetchWithMeta(ctx, opts)
+	return routers, err
+}
+
+// FetchWithMeta is like Fetch but also returns the parsed consensus metadata
+// (validity timestamps), which a client uses to schedule the next consensus
+// refresh before FreshUntil.
+func FetchWithMeta(ctx context.Context, opts FetchOptions) (map[string]*Router, *ConsensusMeta, error) {
 	if opts.Timeout == 0 {
 		opts.Timeout = 120 * time.Second
 	}
@@ -114,33 +129,46 @@ func Fetch(ctx context.Context, opts FetchOptions) (map[string]*Router, error) {
 
 	client := &http.Client{Transport: &dialTransport{upstream: opts.UpstreamProxy}, Timeout: 0}
 
-	// 1. Fetch the microconsensus.
+	// 1. Fetch the microconsensus, retrying across authorities with
+	//    exponential backoff. Each round tries every authority in order; if
+	//    none succeed and retries remain, we back off and try again. This
+	//    mirrors the C client's download_status failure schedule
+	//    (dirclient.c: download_status_increment_failure).
 	var consensus []byte
 	var consSource *DirectoryAuthority
 	var errs []string
-	for i := range opts.Authorities {
-		a := opts.Authorities[i]
-		body, err := getWith(ctx, client, a.ConsensusURL)
-		if err != nil {
-			errs = append(errs, fmt.Sprintf("%s consensus: %v", a.Name, err))
-			continue
+	attempts := opts.Retries + 1
+	for round := 0; round < attempts; round++ {
+		consensus, consSource, errs = fetchConsensusOnce(ctx, client, opts.Authorities)
+		if consensus != nil {
+			break
 		}
-		if !looksLikeConsensus(body) {
-			errs = append(errs, fmt.Sprintf("%s consensus: not a consensus", a.Name))
-			continue
+		if round+1 >= attempts {
+			break
 		}
-		consensus = body
-		consSource = &a
-		break
+		// Exponential backoff with jitter: 1s, 2s, 4s, ... capped at 30s.
+		backoff := time.Duration(1<<round) * time.Second
+		if backoff > 30*time.Second {
+			backoff = 30 * time.Second
+		}
+		select {
+		case <-ctx.Done():
+			break
+		case <-time.After(backoff):
+		}
+		if ctx.Err() != nil {
+			break
+		}
 	}
 	if consensus == nil {
-		return nil, fmt.Errorf("directory: fetch consensus failed: %s", strings.Join(errs, "; "))
+		return nil, nil, fmt.Errorf("directory: fetch consensus failed after %d round(s): %s", attempts, strings.Join(errs, "; "))
 	}
 
 	routers, err := ParseConsensus(consensus)
 	if err != nil {
-		return nil, fmt.Errorf("directory: parse consensus: %w", err)
+		return nil, nil, fmt.Errorf("directory: parse consensus: %w", err)
 	}
+	meta, _ := ParseConsensusMeta(consensus) // best-effort; nil if malformed
 
 	// 1b. Verify the consensus signatures. This is the authoritative
 	//     authentication of the directory document: the dirport TLS
@@ -151,14 +179,14 @@ func Fetch(ctx context.Context, opts FetchOptions) (map[string]*Router, error) {
 	if opts.VerifySignatures {
 		certs, err := fetchAuthorityCerts(ctx, client, opts.Authorities, consensus)
 		if err != nil {
-			return nil, fmt.Errorf("directory: fetch authority certs: %w", err)
+			return nil, nil, fmt.Errorf("directory: fetch authority certs: %w", err)
 		}
 		good, err := VerifyConsensusSignatures(consensus, certs)
 		if err != nil {
-			return nil, fmt.Errorf("directory: verify consensus signatures: %w", err)
+			return nil, nil, fmt.Errorf("directory: verify consensus signatures: %w", err)
 		}
 		if good < ConsensusQuorum() {
-			return nil, fmt.Errorf("directory: consensus has %d good signatures, need %d", good, ConsensusQuorum())
+			return nil, nil, fmt.Errorf("directory: consensus has %d good signatures, need %d", good, ConsensusQuorum())
 		}
 	}
 
@@ -175,7 +203,7 @@ func Fetch(ctx context.Context, opts FetchOptions) (map[string]*Router, error) {
 	}
 	if mdSource == nil || mdSource.MicrodescURL == nil {
 		// No microdescriptor source; return routers with consensus fields only.
-		return routers, nil
+		return routers, meta, nil
 	}
 
 	type job struct {
@@ -205,12 +233,12 @@ func Fetch(ctx context.Context, opts FetchOptions) (map[string]*Router, error) {
 		fetched++
 	}
 	if fetched == 0 {
-		return routers, fmt.Errorf("directory: fetched 0 microdescriptors from %s", mdSource.Name)
+		return routers, meta, fmt.Errorf("directory: fetched 0 microdescriptors from %s", mdSource.Name)
 	}
 	if err := ParseMicrodescriptors([]byte(mdBuf.String()), routers); err != nil {
-		return routers, fmt.Errorf("directory: parse microdescriptors: %w", err)
+		return routers, meta, fmt.Errorf("directory: parse microdescriptors: %w", err)
 	}
-	return routers, nil
+	return routers, meta, nil
 }
 
 // dialTransport is an http.RoundTripper that dials each connection through the
@@ -285,6 +313,32 @@ func getWith(ctx context.Context, client *http.Client, url string) ([]byte, erro
 		return nil, fmt.Errorf("status %d", resp.StatusCode)
 	}
 	return io.ReadAll(resp.Body)
+}
+
+// fetchConsensusOnce tries each authority in order and returns the first
+// consensus body that passes the sanity check, along with its source. It
+// returns nil consensus (and the accumulated errors) if no authority
+// succeeds in this round.
+func fetchConsensusOnce(ctx context.Context, client *http.Client, authorities []DirectoryAuthority) ([]byte, *DirectoryAuthority, []string) {
+	var consensus []byte
+	var consSource *DirectoryAuthority
+	var errs []string
+	for i := range authorities {
+		a := authorities[i]
+		body, err := getWith(ctx, client, a.ConsensusURL)
+		if err != nil {
+			errs = append(errs, fmt.Sprintf("%s consensus: %v", a.Name, err))
+			continue
+		}
+		if !looksLikeConsensus(body) {
+			errs = append(errs, fmt.Sprintf("%s consensus: not a consensus", a.Name))
+			continue
+		}
+		consensus = body
+		consSource = &a
+		break
+	}
+	return consensus, consSource, errs
 }
 
 // looksLikeConsensus sanity-checks that the document is a microconsensus.

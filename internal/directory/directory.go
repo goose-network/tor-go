@@ -21,9 +21,65 @@ import (
 	"encoding/hex"
 	"fmt"
 	"strings"
+	"time"
 
 	"github.com/proxy/tor-go/internal/link"
 )
+
+// ConsensusMeta holds the validity timestamps parsed from a consensus
+// document's header. A client should re-fetch the consensus before
+// FreshUntil (the document is "fresh" until then, "valid" until ValidUntil).
+type ConsensusMeta struct {
+	ValidAfter  time.Time
+	FreshUntil  time.Time
+	ValidUntil  time.Time
+}
+
+// ParseConsensusMeta extracts the validity timestamps from a consensus
+// document. Returns an error if any of the three required header lines are
+// missing or malformed.
+func ParseConsensusMeta(text []byte) (*ConsensusMeta, error) {
+	meta := &ConsensusMeta{}
+	sc := bufio.NewScanner(bytes.NewReader(text))
+	sc.Buffer(make([]byte, 1<<20), 1<<20)
+	got := 0
+	for sc.Scan() {
+		line := sc.Text()
+		switch {
+		case strings.HasPrefix(line, "valid-after "):
+			t, err := time.Parse("2006-01-02 15:04:05", strings.TrimPrefix(line, "valid-after "))
+			if err != nil {
+				return nil, fmt.Errorf("directory: parse valid-after: %w", err)
+			}
+			meta.ValidAfter = t
+			got++
+		case strings.HasPrefix(line, "fresh-until "):
+			t, err := time.Parse("2006-01-02 15:04:05", strings.TrimPrefix(line, "fresh-until "))
+			if err != nil {
+				return nil, fmt.Errorf("directory: parse fresh-until: %w", err)
+			}
+			meta.FreshUntil = t
+			got++
+		case strings.HasPrefix(line, "valid-until "):
+			t, err := time.Parse("2006-01-02 15:04:05", strings.TrimPrefix(line, "valid-until "))
+			if err != nil {
+				return nil, fmt.Errorf("directory: parse valid-until: %w", err)
+			}
+			meta.ValidUntil = t
+			got++
+		}
+		if got == 3 {
+			break
+		}
+	}
+	if err := sc.Err(); err != nil {
+		return nil, err
+	}
+	if got != 3 {
+		return nil, fmt.Errorf("directory: consensus missing validity timestamps (found %d/3)", got)
+	}
+	return meta, nil
+}
 
 // Router is a parsed relay entry combining consensus routing info with its
 // microdescriptor.
