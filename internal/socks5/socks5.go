@@ -19,6 +19,7 @@ import (
 	"log"
 	"net"
 	"strconv"
+	"strings"
 	"sync"
 	"time"
 
@@ -287,6 +288,16 @@ func (s *Server) handleConnect(ctx context.Context, conn net.Conn, host string, 
 	target := net.JoinHostPort(host, strconv.Itoa(int(port)))
 	log.Printf("socks5: CONNECT %s", target)
 
+	// Hidden-service (.onion) targets require the client-side hidden-service
+	// subsystem (introduction-point / rendezvous circuits), which this client
+	// does not implement. Refuse them explicitly with "command not supported"
+	// rather than sending them to a normal exit, which cannot resolve .onion.
+	if isOnionHost(host) {
+		log.Printf("socks5: refusing .onion target %s (hidden services unsupported)", target)
+		reply(conn, repCmdNotSupported, nil, 0)
+		return
+	}
+
 	stream, err := s.dialer.DialStream(ctx, target)
 	if err != nil {
 		log.Printf("socks5: dial %s failed: %v", target, err)
@@ -300,6 +311,12 @@ func (s *Server) handleConnect(ctx context.Context, conn net.Conn, host string, 
 		return
 	}
 	pipe(conn, stream)
+}
+
+// isOnionHost reports whether host is a .onion hidden-service address (case-
+// insensitive, matching the standard v2/v3 suffix).
+func isOnionHost(host string) bool {
+	return strings.HasSuffix(strings.ToLower(host), ".onion")
 }
 
 // handleResolve performs a SOCKS5 RESOLVE (Tor extension): resolve hostname
