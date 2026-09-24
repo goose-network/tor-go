@@ -6,8 +6,9 @@
 // are layered on top.
 //
 // This mirrors the "ClientTransportPlugin" / SOCKS proxy support in
-// src/core/or/connection_or.c and src/lib/transports/socks5.c of the C
-// reference implementation, restricted to SOCKS5 with no authentication.
+// src/core/or/connection_or.c of the C reference implementation (with the
+// SOCKS5 wire format defined in src/trunnel/socks5.c), restricted to SOCKS5
+// with no authentication.
 package proxy
 
 import (
