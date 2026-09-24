@@ -17,11 +17,13 @@ import (
 	"fmt"
 	"io"
 	"log"
+	"net"
 	"sync"
 	"time"
 
 	"github.com/proxy/tor-go/internal/circuit"
 	"github.com/proxy/tor-go/internal/directory"
+	"github.com/proxy/tor-go/internal/guard"
 	"github.com/proxy/tor-go/internal/link"
 	"github.com/proxy/tor-go/internal/socks5"
 )
@@ -58,6 +60,9 @@ type Client struct {
 	link   *link.Link
 	dir    map[string]*directory.Router
 	guard  *directory.Router
+	// guards is the prop271 guard-selection state machine. It is nil when the
+	// caller pinned a specific guard via Config.Guard (no failover).
+	guards *guard.Manager
 	socks  *socks5.Server
 	closed bool
 }
@@ -87,23 +92,86 @@ func New(ctx context.Context, cfg *Config) (*Client, error) {
 		cfg.CircuitBuildTimeout = 60 * time.Second
 	}
 
-	guard := cfg.Guard
-	if guard == nil {
-		g, err := directory.SelectGuard(cfg.Directory)
-		if err != nil {
-			return nil, err
+	guardRouter := cfg.Guard
+	var guards *guard.Manager
+	if guardRouter == nil {
+		// Build the prop271 guard state machine from the directory's
+		// Guard-flagged relays and pick an initial guard. The manager drives
+		// failover on connection failure (see Connect).
+		guards = guard.NewManager(guard.Params{})
+		eligible := eligibleGuards(cfg.Directory)
+		guards.ExpandSample(eligible, time.Now())
+		sel := guards.PickForCircuit(eligible, time.Now())
+		if sel == nil {
+			return nil, errors.New("torclient: no guard selected")
 		}
-		guard = g
+		guardRouter = cfg.Directory[sel.Guard.ID]
+		if guardRouter == nil {
+			return nil, fmt.Errorf("torclient: selected guard %s not in directory", sel.Guard.ID)
+		}
 	}
 
-	c := &Client{cfg: cfg, dir: cfg.Directory, guard: guard}
+	c := &Client{cfg: cfg, dir: cfg.Directory, guard: guardRouter, guards: guards}
 	c.socks = socks5.New(cfg.SocksAddr, &dialer{client: c})
 	return c, nil
+}
+
+// eligibleGuards returns the Guard-flagged relays with ntor keys, as
+// guard.EligibleGuard entries keyed by hex identity digest, in bandwidth
+// order (highest first) so the sample prefers high-bandwidth guards.
+func eligibleGuards(dir map[string]*directory.Router) []guard.EligibleGuard {
+	var out []guard.EligibleGuard
+	for _, r := range dir {
+		if !routerHasFlag(r, "Guard") || r.OnionKey == ([32]byte{}) {
+			continue
+		}
+		out = append(out, guard.EligibleGuard{
+			ID:        hexIDDigest(r),
+			Bandwidth: r.Bandwidth,
+		})
+	}
+	// Sort by bandwidth descending for a stable, quality-ordered sample.
+	sortGuardsByBandwidth(out)
+	return out
+}
+
+func sortGuardsByBandwidth(e []guard.EligibleGuard) {
+	for i := 0; i < len(e); i++ {
+		for j := i + 1; j < len(e); j++ {
+			if e[j].Bandwidth > e[i].Bandwidth {
+				e[i], e[j] = e[j], e[i]
+			}
+		}
+	}
+}
+
+func routerHasFlag(r *directory.Router, f string) bool {
+	for _, x := range r.Flags {
+		if x == f {
+			return true
+		}
+	}
+	return false
+}
+
+func hexIDDigest(r *directory.Router) string {
+	const hex = "0123456789abcdef"
+	b := make([]byte, 20*2)
+	for i, v := range r.IDDigest {
+		b[2*i] = hex[v>>4]
+		b[2*i+1] = hex[v&0x0f]
+	}
+	return string(b)
 }
 
 // Connect dials the guard and completes the link handshake. It is called
 // automatically by Serve, but may be called explicitly to connect before
 // serving.
+//
+// When the client was not pinned to a specific guard (Config.Guard nil), the
+// prop271 guard manager drives selection: on a failed connection attempt the
+// guard is marked failed and the next guard is tried, up to a small number of
+// attempts. A successful connection confirms the guard in the manager.
 func (c *Client) Connect(ctx context.Context) error {
 	c.mu.Lock()
 	if c.link != nil {
@@ -112,17 +180,59 @@ func (c *Client) Connect(ctx context.Context) error {
 	}
 	c.mu.Unlock()
 
+	// If a guard was pinned, or no manager is present, dial it directly with
+	// no failover (legacy behavior).
+	if c.guards == nil {
+		return c.dialGuard(ctx, c.guard, "")
+	}
+
+	// prop271 failover: try successive guards from the manager.
+	eligible := eligibleGuards(c.dir)
+	const maxAttempts = 5
+	var lastErr error
+	for attempt := 0; attempt < maxAttempts; attempt++ {
+		sel := c.guards.PickForCircuit(eligible, time.Now())
+		if sel == nil {
+			break
+		}
+		r := c.dir[sel.Guard.ID]
+		if r == nil {
+			// Stale guard ID; mark failed and continue.
+			c.guards.NoteConnectionFailure(sel.Guard.ID, time.Now())
+			continue
+		}
+		err := c.dialGuard(ctx, r, sel.Guard.ID)
+		if err == nil {
+			return nil
+		}
+		lastErr = err
+		c.guards.NoteConnectionFailure(sel.Guard.ID, time.Now())
+		log.Printf("torclient: guard %s (%s) failed: %v; trying next", r.Nickname, r.Address, err)
+	}
+	if lastErr != nil {
+		return fmt.Errorf("torclient: could not connect to any guard after %d attempts: %w", maxAttempts, lastErr)
+	}
+	return errors.New("torclient: no guard available to connect")
+}
+
+// dialGuard dials a single guard and, on success, records it as the active
+// guard and (if guardID is non-empty) confirms it in the guard manager.
+func (c *Client) dialGuard(ctx context.Context, r *directory.Router, guardID string) error {
 	dctx, cancel := context.WithTimeout(ctx, c.cfg.LinkDialTimeout)
 	defer cancel()
-	l, err := link.DialWithUpstream(dctx, c.cfg.UpstreamProxy, c.guard.Address, c.guard.IDDigest[:])
+	l, err := link.DialWithUpstream(dctx, c.cfg.UpstreamProxy, r.Address, r.IDDigest[:])
 	if err != nil {
-		return fmt.Errorf("torclient: connect to guard %s: %w", c.guard.Address, err)
+		return fmt.Errorf("connect to guard %s: %w", r.Address, err)
 	}
 	c.mu.Lock()
 	c.link = l
+	c.guard = r
 	c.mu.Unlock()
+	if guardID != "" {
+		c.guards.NoteConnectionSuccess(guardID, time.Now())
+	}
 	log.Printf("torclient: connected to guard %s (%s) link-proto=%d",
-		c.guard.Nickname, c.guard.Address, l.Protocol())
+		r.Nickname, r.Address, l.Protocol())
 	return nil
 }
 
@@ -237,6 +347,92 @@ func (s *streamWrap) Write(p []byte) (int, error) { return s.stream.Write(p) }
 func (s *streamWrap) Close() error {
 	s.stream.Close()
 	return s.circ.Close()
+}
+
+// Resolve performs a hostname lookup through a fresh Tor circuit's exit,
+// returning the first resolved address. It builds a one-hop-extended circuit
+// (path length = configured PathLen) and issues a RELAY_RESOLVE.
+func (d *dialer) Resolve(ctx context.Context, hostname string) (string, error) {
+	c := d.client
+	c.mu.Lock()
+	l := c.link
+	c.mu.Unlock()
+	if l == nil {
+		return "", errors.New("torclient: not connected to guard")
+	}
+	path, err := c.buildPath()
+	if err != nil {
+		return "", err
+	}
+	bctx, cancel := context.WithTimeout(ctx, c.cfg.CircuitBuildTimeout)
+	defer cancel()
+	circ, err := circuit.New(bctx, l, path)
+	if err != nil {
+		return "", err
+	}
+	defer circ.Close()
+	return circ.Resolve(ctx, hostname)
+}
+
+// ResolvePtr performs a reverse DNS lookup through a fresh Tor circuit's exit.
+func (d *dialer) ResolvePtr(ctx context.Context, ip string) (string, error) {
+	// Tor's RESOLVE_PTR is issued by sending a RELAY_RESOLVE with a target of
+	// the in-addr.arpa / ip6.arpa form. We build the arpa name and resolve it;
+	// the exit interprets a .in-addr.arpa target as a reverse lookup.
+	arpa, err := reverseARPA(ip)
+	if err != nil {
+		return "", err
+	}
+	c := d.client
+	c.mu.Lock()
+	l := c.link
+	c.mu.Unlock()
+	if l == nil {
+		return "", errors.New("torclient: not connected to guard")
+	}
+	path, err := c.buildPath()
+	if err != nil {
+		return "", err
+	}
+	bctx, cancel := context.WithTimeout(ctx, c.cfg.CircuitBuildTimeout)
+	defer cancel()
+	circ, err := circuit.New(bctx, l, path)
+	if err != nil {
+		return "", err
+	}
+	defer circ.Close()
+	return circ.Resolve(ctx, arpa)
+}
+
+// reverseARPA converts an IP address string to its DNS reverse-lookup name
+// (e.g. "1.2.3.4" -> "4.3.2.1.in-addr.arpa").
+func reverseARPA(ipStr string) (string, error) {
+	ip := net.ParseIP(ipStr)
+	if ip == nil {
+		return "", fmt.Errorf("torclient: invalid IP %q", ipStr)
+	}
+	if v4 := ip.To4(); v4 != nil {
+		return fmt.Sprintf("%d.%d.%d.%d.in-addr.arpa", v4[3], v4[2], v4[1], v4[0]), nil
+	}
+	// IPv6: nibble-reverse the full 16-byte address.
+	v6 := ip.To16()
+	var b [128]byte
+	for i := 0; i < 16; i++ {
+		hi := v6[15-i] >> 4
+		lo := v6[15-i] & 0x0f
+		b[i*4] = hexNibble(lo)
+		b[i*4+1] = '.'
+		b[i*4+2] = hexNibble(hi)
+		b[i*4+3] = '.'
+	}
+	return string(b[:]) + "ip6.arpa", nil
+}
+
+func hexNibble(n byte) byte {
+	if n < 10 {
+		return '0' + n
+	}
+	return 'a' + n - 10
 }
 
 // Guard returns the selected guard relay.

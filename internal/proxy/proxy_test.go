@@ -2,6 +2,7 @@ package proxy_test
 
 import (
 	"context"
+	"errors"
 	"io"
 	"net"
 	"testing"
@@ -141,6 +142,30 @@ func (d *directDialer) DialStream(ctx context.Context, target string) (io.ReadWr
 		return nil, err
 	}
 	return c, nil
+}
+
+func (d *directDialer) Resolve(ctx context.Context, hostname string) (string, error) {
+	var r net.Resolver
+	addrs, err := r.LookupHost(ctx, hostname)
+	if err != nil {
+		return "", err
+	}
+	if len(addrs) == 0 {
+		return "", errors.New("no address")
+	}
+	return addrs[0], nil
+}
+
+func (d *directDialer) ResolvePtr(ctx context.Context, ip string) (string, error) {
+	var r net.Resolver
+	names, err := r.LookupAddr(ctx, ip)
+	if err != nil {
+		return "", err
+	}
+	if len(names) == 0 {
+		return "", errors.New("no PTR record")
+	}
+	return names[0], nil
 }
 
 func waitForListen(addr string, timeout time.Duration) error {

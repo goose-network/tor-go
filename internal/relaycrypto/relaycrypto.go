@@ -41,6 +41,14 @@ const (
 	TotalKeyLen = KeyMaterialLen + KHLen
 )
 
+// SENDME v1 (proposal 289) carries a 4-byte digest tag computed over the
+// last SENDME_INC cells delivered on the circuit, so the peer can confirm the
+// SENDME corresponds to actually-received data. The tag is the first 4 bytes
+// of the running backward digest taken at the point the SENDME is sent. See
+// src/core/crypto/relay_crypto_tor1.c (sendme_digest) and
+// src/core/or/sendme.c.
+const SendmeTagLen = 4
+
 // Layer is the crypto state for a single hop on an origin circuit.
 type Layer struct {
 	// Forward direction (client -> hop): used to encrypt outgoing cells
@@ -52,6 +60,12 @@ type Layer struct {
 	// and to verify the relay digest.
 	bDigest hashState
 	bCipher cipher.Stream
+
+	// sendmeDigest is a separate running SHA-1 over the backward-direction
+	// cell payloads, used to compute the v1 SENDME tag the client sends back
+	// to this hop. It is updated only for cells this hop delivered to us
+	// (i.e. recognized at this layer). See cpath_sendme_tag in the C code.
+	sendmeDigest hashState
 }
 
 // hashState is a running SHA-1 digest that can be copied.
@@ -107,6 +121,11 @@ func newLayer(keyMaterial []byte, reversed bool) (*Layer, error) {
 	l.fDigest.Write(fDigestSeed)
 	l.bDigest = newDigest()
 	l.bDigest.Write(bDigestSeed)
+	// The SENDME v1 digest is seeded with the backward digest seed, matching
+	// the C code's relay_crypto_init (the sendme digest starts from the same
+	// b_digest seed but is advanced independently of the integrity digest).
+	l.sendmeDigest = newDigest()
+	l.sendmeDigest.Write(bDigestSeed)
 
 	fc, err := aes.NewCipher(fCipherKey)
 	if err != nil {
@@ -179,7 +198,24 @@ func (l *Layer) EncryptOutbound(payload []byte) {
 // verify the digest.
 func (l *Layer) DecryptInbound(payload []byte) bool {
 	l.bCipher.XORKeyStream(payload, payload)
-	return relayDigestMatchesV0(l.bDigest, payload)
+	matched := relayDigestMatchesV0(l.bDigest, payload)
+	if matched {
+		// Absorb the recognized cell into the SENDME digest. The C code
+		// (relay_crypto_tor1.c) updates the sendme digest over the cell body
+		// for every cell delivered at this layer.
+		l.sendmeDigest.Write(payload)
+	}
+	return matched
+}
+
+// SendmeTag returns the 4-byte v1 SENDME tag for this hop: the first 4 bytes
+// of the current SENDME digest. The caller sends this tag in the body of a
+// circuit-level SENDME addressed to this hop. See cpath_get_sendme_tag.
+func (l *Layer) SendmeTag() [SendmeTagLen]byte {
+	sum := l.sendmeDigest.Sum(nil)
+	var tag [SendmeTagLen]byte
+	copy(tag[:], sum[:SendmeTagLen])
+	return tag
 }
 
 // EncryptForwardOnly encrypts a relay cell payload in the forward direction

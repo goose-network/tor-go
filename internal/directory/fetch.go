@@ -14,6 +14,8 @@ import (
 	"bufio"
 	"context"
 	"crypto/tls"
+	"encoding/hex"
+	"errors"
 	"fmt"
 	"io"
 	"net"
@@ -36,26 +38,35 @@ type DirectoryAuthority struct {
 	// SHA-256 digest (the "m" line digest, base64-decoded then hex-encoded).
 	// If nil, this authority does not serve microdescriptors.
 	MicrodescURL func(hexDigest string) string
+	// CertURL returns the URL for an authority certificate given its
+	// SHA-1 fingerprint (the identity-key digest, lowercase hex). If nil,
+	// this authority does not serve authority certs. The standard endpoint
+	// is /tor/keys/fp/<fingerprint>.
+	CertURL func(hexFingerprint string) string
 }
 
 // DefaultAuthorities is a list of directory sources to try, in order. The
 // consensus-health mirror is first because it is a stable HTTPS endpoint; the
-// directory authorities follow and also serve microdescriptors.
+// directory authorities follow and also serve microdescriptors and authority
+// certificates.
 var DefaultAuthorities = []DirectoryAuthority{
 	{
 		Name:         "consensus-health",
 		ConsensusURL: "https://consensus-health.torproject.org/consensus-microdesc/consensus-microdesc-latest",
 		MicrodescURL: nil,
+		CertURL:      nil,
 	},
 	{
 		Name:         "moria1",
 		ConsensusURL: "https://128.31.0.34:9131/tor/status-vote/current/consensus-microdesc",
 		MicrodescURL: func(h string) string { return "https://128.31.0.34:9131/tor/micro/d/" + h },
+		CertURL:      func(fp string) string { return "https://128.31.0.34:9131/tor/keys/fp/" + fp },
 	},
 	{
 		Name:         "maatuska",
 		ConsensusURL: "https://171.25.193.78:443/tor/status-vote/current/consensus-microdesc",
 		MicrodescURL: func(h string) string { return "https://171.25.193.78:443/tor/micro/d/" + h },
+		CertURL:      func(fp string) string { return "https://171.25.193.78:443/tor/keys/fp/" + fp },
 	},
 }
 
@@ -73,6 +84,15 @@ type FetchOptions struct {
 	// bootstrap time in tests). If zero, all referenced microdescriptors are
 	// fetched.
 	MaxMicrodescs int
+	// VerifySignatures controls whether the fetched consensus is rejected
+	// unless it carries valid signatures from a quorum of trusted v3
+	// directory authorities. When true, Fetch also downloads the authority
+	// certificates referenced by the consensus signatures and verifies each
+	// signature. This is the authoritative authentication of the directory
+	// document and should be enabled for any real-network use. When false
+	// (the default, for backward compatibility with tests that mint their
+	// own consensus), the consensus is accepted without a signature check.
+	VerifySignatures bool
 }
 
 // Fetch downloads a real microconsensus and its microdescriptors, parses them,
@@ -120,6 +140,26 @@ func Fetch(ctx context.Context, opts FetchOptions) (map[string]*Router, error) {
 	routers, err := ParseConsensus(consensus)
 	if err != nil {
 		return nil, fmt.Errorf("directory: parse consensus: %w", err)
+	}
+
+	// 1b. Verify the consensus signatures. This is the authoritative
+	//     authentication of the directory document: the dirport TLS
+	//     connection is not CA-verified, so without this check a
+	//     man-in-the-middle could substitute a tampered consensus. We fetch
+	//     the authority certificates referenced by the signatures, verify
+	//     each signature, and require a quorum of good signatures.
+	if opts.VerifySignatures {
+		certs, err := fetchAuthorityCerts(ctx, client, opts.Authorities, consensus)
+		if err != nil {
+			return nil, fmt.Errorf("directory: fetch authority certs: %w", err)
+		}
+		good, err := VerifyConsensusSignatures(consensus, certs)
+		if err != nil {
+			return nil, fmt.Errorf("directory: verify consensus signatures: %w", err)
+		}
+		if good < ConsensusQuorum() {
+			return nil, fmt.Errorf("directory: consensus has %d good signatures, need %d", good, ConsensusQuorum())
+		}
 	}
 
 	// 2. Fetch microdescriptors from the first authority that serves them
@@ -251,4 +291,60 @@ func getWith(ctx context.Context, client *http.Client, url string) ([]byte, erro
 func looksLikeConsensus(b []byte) bool {
 	s := string(b)
 	return strings.Contains(s, "\nr ") && strings.Contains(s, "\nm ")
+}
+
+// fetchAuthorityCerts downloads the authority certificates referenced by the
+// consensus's directory-signature blocks. It returns a map keyed by the
+// authority identity digest (lowercase hex) to the parsed, self-verified
+// certificate. Certificates are fetched from the first authority in the list
+// that exposes a CertURL endpoint; missing or malformed certs are skipped
+// (the caller's quorum check tolerates some missing authorities).
+func fetchAuthorityCerts(ctx context.Context, client *http.Client, authorities []DirectoryAuthority, consensus []byte) (map[string]*AuthorityCert, error) {
+	sigs, err := ParseConsensusSignatures(consensus)
+	if err != nil {
+		return nil, fmt.Errorf("parse signatures: %w", err)
+	}
+	// Collect the distinct identity digests that are recognized authorities,
+	// so we only fetch certs we will actually use.
+	want := map[string]bool{}
+	for _, sig := range sigs {
+		if TrustedV3AuthorityDigests[strings.ToUpper(sig.IdentityDigest)] {
+			want[strings.ToLower(sig.IdentityDigest)] = true
+		}
+	}
+	if len(want) == 0 {
+		return nil, errors.New("no recognized authority signatures in consensus")
+	}
+
+	// Find a source that serves certs.
+	var certSource *DirectoryAuthority
+	for i := range authorities {
+		if authorities[i].CertURL != nil {
+			certSource = &authorities[i]
+			break
+		}
+	}
+	if certSource == nil {
+		return nil, errors.New("no authority cert source configured")
+	}
+
+	certs := make(map[string]*AuthorityCert, len(want))
+	for fp := range want {
+		body, err := getWith(ctx, client, certSource.CertURL(fp))
+		if err != nil {
+			continue // skip missing cert
+		}
+		cert, err := ParseAuthorityCert(body)
+		if err != nil {
+			continue // skip malformed/unverifiable cert
+		}
+		// Confirm the cert's identity digest matches the fingerprint we
+		// requested (defensive: the cache should return the right cert).
+		got := strings.ToLower(hex.EncodeToString(cert.IdentityDigest[:]))
+		if got != fp {
+			continue
+		}
+		certs[fp] = cert
+	}
+	return certs, nil
 }

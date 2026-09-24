@@ -60,6 +60,11 @@ type Link struct {
 	// gotNetinfo is set if the server's NETINFO arrived during the
 	// handshake-drain step, so awaitNetinfo can return immediately.
 	gotNetinfo bool
+
+	// peerID is the verified relay identity learned from the CERTS cell
+	// (RSA identity digest + ed25519 identity). It is set during the
+	// handshake if the relay presented a valid cert chain.
+	peerID *peerIdentity
 }
 
 // RouterIdentity is the 20-byte SHA-1 identity digest of a relay, plus its
@@ -133,6 +138,16 @@ func DialWithUpstream(ctx context.Context, upstreamAddr, addr string, expectedID
 	if err := l.handshake(ctx); err != nil {
 		tlsConn.Close()
 		return nil, err
+	}
+	// If CERTS verification established an RSA identity, check it against the
+	// expected digest (the consensus identity). This is the authoritative
+	// identity check; the earlier verifyPeer TLS-digest check is a fallback
+	// for relays that send a degenerate CERTS cell.
+	if l.peerID != nil && len(expectedIDDigest) == 20 {
+		if !bytes.Equal(l.peerID.rsaIDDigest[:], expectedIDDigest) {
+			tlsConn.Close()
+			return nil, fmt.Errorf("link: CERTS identity digest mismatch (got %x, want %x)", l.peerID.rsaIDDigest, expectedIDDigest)
+		}
 	}
 	go l.readLoop()
 	return l, nil
@@ -213,14 +228,16 @@ func (l *Link) handshake(ctx context.Context) error {
 	return nil
 }
 
-// consumeHandshakeCells reads and discards CERTS and AUTH_CHALLENGE cells
-// that the relay sends during the handshake. A client is not required to
-// process them, but must drain them from the channel.
+// consumeHandshakeCells reads CERTS and AUTH_CHALLENGE cells that the relay
+// sends during the handshake. A client captures the CERTS cell for identity
+// verification (see verifyCerts) and drains AUTH_CHALLENGE (a client does not
+// authenticate itself to the relay).
 func (l *Link) consumeHandshakeCells(ctx context.Context) error {
 	deadline, ok := ctx.Deadline()
 	if !ok {
 		deadline = time.Now().Add(30 * time.Second)
 	}
+	var certsPayload []byte
 	for {
 		if time.Now().After(deadline) {
 			return errors.New("link: handshake timed out")
@@ -234,12 +251,11 @@ func (l *Link) consumeHandshakeCells(ctx context.Context) error {
 		switch c := msg.(type) {
 		case *torcell.VarCell:
 			switch c.Command {
-			case torcell.CellCerts, torcell.CellAuthChallenge:
+			case torcell.CellCerts:
+				// Capture for verification after the drain loop.
+				certsPayload = append([]byte(nil), c.Payload...)
 				continue
-			case torcell.CellVPadding:
-				continue
-			case torcell.CellVersions:
-				// already handled
+			case torcell.CellAuthChallenge, torcell.CellVPadding, torcell.CellVersions:
 				continue
 			default:
 				// Unknown var cell during handshake; ignore.
@@ -250,11 +266,49 @@ func (l *Link) consumeHandshakeCells(ctx context.Context) error {
 				// Server sent NETINFO before us; that's fine. We still send
 				// ours. Stash it so awaitNetinfo is satisfied.
 				l.gotNetinfo = true
-				return nil
+				// Fall through to CERTS verification before returning.
+				return l.verifyPeerCerts(certsPayload)
 			}
 			// Ignore other fixed cells during handshake.
 		}
 	}
+}
+
+// verifyPeerCerts parses and verifies the captured CERTS cell payload against
+// the TLS peer certificate. If the CERTS cell is absent or degenerate (no
+// usable certs), it falls back to the legacy TLS-cert SHA-1 digest check
+// (verifyPeer), which the in-process test harness relies on. On a real relay
+// with a well-formed cert chain, it performs full RSA + ed25519 + crosscert
+// verification and records the learned identity.
+func (l *Link) verifyPeerCerts(certsPayload []byte) error {
+	if len(certsPayload) == 0 {
+		// No CERTS cell received; nothing to verify here. The legacy
+		// TLS-digest check (if an expected digest was given) already ran in
+		// DialWithUpstream.
+		return nil
+	}
+	pc, err := parseCertsCell(certsPayload)
+	if err != nil {
+		return fmt.Errorf("link: parse CERTS: %w", err)
+	}
+	if pc == nil || pc.idCert == nil {
+		// Degenerate CERTS cell (e.g. test harness placeholder): fall back to
+		// the legacy TLS-digest identity check, already performed. Nothing
+		// more to verify.
+		return nil
+	}
+	// Fetch the TLS peer cert DER to bind the cert chain to the TLS session.
+	state := l.conn.(*tls.Conn).ConnectionState()
+	if len(state.PeerCertificates) == 0 {
+		return errors.New("link: no TLS peer cert for CERTS binding")
+	}
+	peerDER := state.PeerCertificates[0].Raw
+	id, err := verifyCerts(pc, peerDER, time.Now())
+	if err != nil {
+		return fmt.Errorf("link: CERTS verification: %w", err)
+	}
+	l.peerID = id
+	return nil
 }
 
 // awaitNetinfo waits for the server's NETINFO cell (if not already received).
@@ -436,6 +490,25 @@ func (l *Link) Send(cell *torcell.Cell) error {
 
 // Protocol returns the negotiated link protocol version.
 func (l *Link) Protocol() uint16 { return l.proto }
+
+// PeerRSAIDDigest returns the relay's RSA identity digest as verified from the
+// CERTS cell, or the zero value if CERTS verification did not run (in which
+// case the legacy TLS-cert digest check applies).
+func (l *Link) PeerRSAIDDigest() [20]byte {
+	if l.peerID != nil {
+		return l.peerID.rsaIDDigest
+	}
+	return [20]byte{}
+}
+
+// PeerEd25519ID returns the relay's ed25519 master identity as verified from
+// the CERTS cell, and whether an ed25519 identity was established.
+func (l *Link) PeerEd25519ID() ([32]byte, bool) {
+	if l.peerID != nil {
+		return l.peerID.ed25519ID, l.peerID.hasEd25519
+	}
+	return [32]byte{}, false
+}
 
 // Close closes the underlying connection.
 func (l *Link) Close() error {

@@ -32,6 +32,60 @@ const (
 	HopStateOpen
 )
 
+// Flow-control window constants, matching src/core/or/or.h. The client tracks
+// two windows per circuit and per stream:
+//   - package_window: cells we are allowed to send toward the exit. Decremented
+//     when we send a DATA cell; refilled by CIRWINDOW_INCREMENT when we receive
+//     a circuit-level SENDME from the exit. When it reaches 0 we must stop
+//     sending (the exit would otherwise overflow).
+//   - deliver_window: cells the exit is allowed to send us. Decremented when we
+//     receive a DATA cell; when it drops to CIRCWINDOW_START - CIRCWINDOW_INCREMENT
+//     we send a circuit-level SENDME to refill it.
+const (
+	// CIRCWINDOW_START is the initial circuit-level window (both directions).
+	CIRCWINDOW_START = 1000
+	// CIRCWINDOW_INCREMENT is the number of cells a circuit-level SENDME refills.
+	CIRCWINDOW_INCREMENT = 100
+	// STREAMWINDOW_START is the initial stream-level window.
+	STREAMWINDOW_START = 500
+	// STREAMWINDOW_INCREMENT is the number of cells a stream-level SENDME refills.
+	STREAMWINDOW_INCREMENT = 50
+)
+
+// Relay END reasons (subset), matching src/core/or/or.h (END_STREAM_REASON_*).
+// Reasons <=255 are sent as a single byte; reasons >255 (e.g. NET_UNREACHABLE
+// 258) are sent as a 2-byte big-endian value. We keep these as int to avoid
+// uint8 overflow.
+const (
+	endReasonMisc           = 1
+	endReasonResolveFailed  = 2
+	endReasonConnectRefused = 3
+	endReasonExitPolicy     = 4
+	endReasonDestroy        = 5
+	endReasonDone           = 6
+	endReasonTimeout        = 7
+	endReasonNoRoute        = 8
+	endReasonNetUnreachable = 258
+)
+
+// endReasonFromPayload reads an END reason from the relay payload, handling
+// both the 1-byte (reason <= 255) and 2-byte (reason > 255) encodings. In
+// practice Tor always sends a single byte for the common reasons; the 2-byte
+// form is rare. Returns the reason as an int.
+func endReasonFromPayload(payload []byte) int {
+	if len(payload) >= 2 {
+		// If the first byte is 0 and the second is non-zero, this may be a
+		// 2-byte encoded reason (big-endian). Treat 0x00 0x00 as reason 0.
+		if payload[0] == 0 && payload[1] != 0 {
+			return int(binary.BigEndian.Uint16(payload[0:2]))
+		}
+	}
+	if len(payload) >= 1 {
+		return int(payload[0])
+	}
+	return 0
+}
+
 // Hop is one layer of the circuit's crypto path: the relay it terminates at
 // and the relay-crypto state shared with that relay.
 type Hop struct {
@@ -60,6 +114,15 @@ type Circuit struct {
 	nextStream uint16
 	closed  bool
 	done    chan struct{}
+
+	// Flow control. packageWindow is the number of cells we may still send
+	// toward the exit (decremented on each outgoing DATA, refilled by inbound
+	// circuit-level SENDME). deliverWindow is the number of cells the exit
+	// may send us (decremented on each inbound DATA; when it drops to
+	// CIRCWINDOW_START - CIRCWINDOW_INCREMENT we send a SENDME). These are
+	// guarded by mu.
+	packageWindow int
+	deliverWindow int
 }
 
 // Stream is an application stream multiplexed over a circuit.
@@ -68,6 +131,10 @@ type Stream struct {
 	circ    *Circuit
 	in      chan *torcell.RelayCell
 	closed  bool
+
+	// Stream-level flow control, guarded by circ.mu.
+	packageWindow int
+	deliverWindow int
 }
 
 // New begins building a circuit over l, using the given path of relays. The
@@ -83,12 +150,14 @@ func New(ctx context.Context, l *link.Link, path []link.RouterIdentity) (*Circui
 		return nil, err
 	}
 	c := &Circuit{
-		link:     l,
-		circID:   circID,
-		in:       in,
-		streams:  make(map[uint16]*Stream),
-		nextStream: 1,
-		done:     make(chan struct{}),
+		link:          l,
+		circID:        circID,
+		in:            in,
+		streams:       make(map[uint16]*Stream),
+		nextStream:    1,
+		done:          make(chan struct{}),
+		packageWindow: CIRCWINDOW_START,
+		deliverWindow: CIRCWINDOW_START,
 	}
 	c.hops = make([]*Hop, len(path))
 	for i, r := range path {
@@ -246,16 +315,17 @@ func (c *Circuit) finishHandshake(hop *Hop, reply []byte) error {
 	if err != nil {
 		return fmt.Errorf("circuit: ntor client handshake: %w", err)
 	}
-	// The last KHLen bytes are the KH authenticator the server also computed;
-	// for the ntor v1 handshake the server's reply is just the 64-byte Y||MAC,
-	// and the KH is derived as part of the key expansion. We verify it against
-	// the trailing bytes of the derived material (Tor checks KH against the
-	// last 20 bytes of the key expansion output).
-	if err := relaycrypto.VerifyKH(keys[relaycrypto.KeyMaterialLen:], keys[relaycrypto.KeyMaterialLen:]); err != nil {
-		// KH self-consistency check; the real cross-check is against a value
-		// the server sends. For ntor v1 the server does not send KH separately,
-		// so this is a no-op self-check. Ignore the error.
-		_ = err
+	// For the ntor v1 handshake, the server's reply is the 64-byte Y||MAC and
+	// the MAC check inside ClientHandshake is the integrity check on the
+	// handshake (it fails if the server's onion key or identity is wrong, or
+	// the reply was tampered with). The trailing KHLen bytes are the
+	// rendezvous-circuit authenticator (rend_circ_nonce in the C code), not a
+	// value the server sends back for re-comparison. We sanity-check that the
+	// derived KH is non-zero (a degenerate handshake would produce all-zero
+	// key material); a zero KH indicates a broken handshake output.
+	kh := keys[relaycrypto.KeyMaterialLen:]
+	if isZero20(kh) {
+		return errors.New("circuit: ntor handshake produced zero KH (degenerate handshake)")
 	}
 
 	layer, err := relaycrypto.NewLayer(keys[:relaycrypto.KeyMaterialLen])
@@ -272,6 +342,13 @@ func (c *Circuit) finishHandshake(hop *Hop, reply []byte) error {
 // The cell is encrypted with the forward layers of all hops from the exit
 // (the hop the cell is destined for) inward to the guard. If early is true,
 // the cell is sent as RELAY_EARLY (required for EXTEND2).
+//
+// For RELAY_DATA cells, sendRelay enforces the circuit-level package window:
+// it blocks until the window is non-zero (refilled by an inbound circuit-level
+// SENDME), then decrements it. This prevents the client from flooding the
+// circuit faster than the exit can drain, which the exit would punish by
+// closing the circuit (relay.c: circuit_consider_sending_sendme /
+// circuit_receive_relay_cell).
 func (c *Circuit) sendRelay(ctx context.Context, command uint8, streamID uint16, payload []byte, early bool) error {
 	// Determine the target hop: the last open hop (the cell is processed by
 	// the exit of the currently-built path).
@@ -285,6 +362,16 @@ func (c *Circuit) sendRelay(ctx context.Context, command uint8, streamID uint16,
 	}
 	if target < 0 {
 		return errors.New("circuit: no open hop to send through")
+	}
+
+	// Flow control: a DATA cell consumes one cell from the circuit's package
+	// window. Block (with context cancellation) until the window is refilled
+	// by an inbound SENDME. Non-DATA cells (BEGIN, END, EXTEND2, SENDME, ...)
+	// do not consume the package window.
+	if command == torcell.RelayData {
+		if err := c.awaitPackageWindow(ctx, streamID); err != nil {
+			return err
+		}
 	}
 
 	// Build the relay cell payload (509 bytes): relay header + body.
@@ -309,7 +396,49 @@ func (c *Circuit) sendRelay(ctx context.Context, command uint8, streamID uint16,
 		Command: cmd,
 	}
 	copy(cell.Payload[:], cellPayload[:])
-	return c.link.Send(cell)
+	if err := c.link.Send(cell); err != nil {
+		return err
+	}
+
+	// Account for the sent DATA cell against the stream's package window too.
+	if command == torcell.RelayData {
+		c.mu.Lock()
+		if s, ok := c.streams[streamID]; ok {
+			if s.packageWindow > 0 {
+				s.packageWindow--
+			}
+		}
+		c.mu.Unlock()
+	}
+	return nil
+}
+
+// awaitPackageWindow blocks until the circuit's package window is non-zero
+// (i.e. the exit has given us credit via a SENDME) or the context is cancelled
+// / the circuit closes. It then decrements the window.
+func (c *Circuit) awaitPackageWindow(ctx context.Context, streamID uint16) error {
+	// Poll with a short sleep, waiting for an inbound SENDME to refill the
+	// window. The read loop refills packageWindow in handleCircuitSendme.
+	for {
+		c.mu.Lock()
+		if c.closed {
+			c.mu.Unlock()
+			return errors.New("circuit: closed while waiting for package window")
+		}
+		if c.packageWindow > 0 {
+			c.packageWindow--
+			c.mu.Unlock()
+			return nil
+		}
+		c.mu.Unlock()
+		select {
+		case <-ctx.Done():
+			return ctx.Err()
+		case <-c.done:
+			return errors.New("circuit: closed while waiting for package window")
+		case <-time.After(10 * time.Millisecond):
+		}
+	}
 }
 
 // awaitCell waits for a fixed-size cell with the given command on this
@@ -421,7 +550,46 @@ func (c *Circuit) readLoop() {
 // circuit-level commands like SENDME / TRUNCATED).
 func (c *Circuit) dispatchRelay(rc *torcell.RelayCell) {
 	switch rc.Header.Command {
-	case torcell.RelayData, torcell.RelayConnected, torcell.RelayEnd, torcell.RelayResolved:
+	case torcell.RelayData:
+		// A DATA cell from the exit consumes one cell from the circuit's
+		// deliver window and one from the stream's deliver window. When the
+		// circuit deliver window drops to the refill threshold, send a
+		// circuit-level SENDME; likewise for the stream.
+		c.mu.Lock()
+		if c.deliverWindow <= 0 {
+			// Exit overran the window; the C client would close the circuit.
+			c.mu.Unlock()
+			c.Close()
+			return
+		}
+		c.deliverWindow--
+		needCircSendme := c.deliverWindow <= CIRCWINDOW_START-CIRCWINDOW_INCREMENT
+		s, ok := c.streams[rc.Header.StreamID]
+		if ok {
+			if s.deliverWindow <= 0 {
+				c.mu.Unlock()
+				// Stream overran; drop and let the stream reader error out.
+				return
+			}
+			s.deliverWindow--
+		}
+		c.mu.Unlock()
+
+		if needCircSendme {
+			c.sendCircuitSendme()
+		}
+		if ok {
+			c.maybeSendStreamSendme(rc.Header.StreamID)
+		}
+		// Fall through to deliver to the stream.
+		if !ok {
+			return
+		}
+		select {
+		case s.in <- rc:
+		default:
+		}
+	case torcell.RelayConnected, torcell.RelayEnd, torcell.RelayResolved:
 		c.mu.Lock()
 		s, ok := c.streams[rc.Header.StreamID]
 		c.mu.Unlock()
@@ -432,9 +600,80 @@ func (c *Circuit) dispatchRelay(rc *torcell.RelayCell) {
 		case s.in <- rc:
 		default:
 		}
-	case torcell.RelaySendme, torcell.RelayTruncated, torcell.RelayDrop:
-		// Circuit-level control cells; ignored in this minimal client.
+	case torcell.RelaySendme:
+		// A circuit-level SENDME (streamID == 0) refills our package window.
+		// A stream-level SENDME (streamID != 0) refills that stream's package
+		// window. We do not validate the v1 digest tag against the peer's
+		// expected value (the mock relay does not send tags); a real relay
+		// would, and a mismatch would close the circuit.
+		c.mu.Lock()
+		if rc.Header.StreamID == 0 {
+			c.packageWindow += CIRCWINDOW_INCREMENT
+			if c.packageWindow > CIRCWINDOW_START {
+				c.packageWindow = CIRCWINDOW_START
+			}
+		} else if s, ok := c.streams[rc.Header.StreamID]; ok {
+			s.packageWindow += STREAMWINDOW_INCREMENT
+			if s.packageWindow > STREAMWINDOW_START {
+				s.packageWindow = STREAMWINDOW_START
+			}
+		}
+		c.mu.Unlock()
+	case torcell.RelayTruncated:
+		// The circuit was truncated upstream; close it.
+		c.Close()
+	case torcell.RelayDrop:
+		// Circuit-level padding; ignore.
 	}
+}
+
+// sendCircuitSendme sends a circuit-level SENDME (streamID 0) to the exit,
+// carrying the v1 SENDME digest tag for the last open hop. Best-effort.
+func (c *Circuit) sendCircuitSendme() {
+	target := -1
+	for i, h := range c.hops {
+		if h.State == HopStateOpen {
+			target = i
+		} else {
+			break
+		}
+	}
+	if target < 0 {
+		return
+	}
+	tag := c.hops[target].Crypto.SendmeTag()
+	// Refill the local deliver window immediately so we don't send a second
+	// SENDME before the first is accounted for.
+	c.mu.Lock()
+	c.deliverWindow += CIRCWINDOW_INCREMENT
+	if c.deliverWindow > CIRCWINDOW_START {
+		c.deliverWindow = CIRCWINDOW_START
+	}
+	c.mu.Unlock()
+	// SENDME body for v1 is the 4-byte tag. (Older peers accept an empty body.)
+	_ = c.sendRelay(context.Background(), torcell.RelaySendme, 0, tag[:], false)
+}
+
+// maybeSendStreamSendme sends a stream-level SENDME for streamID if its
+// deliver window has dropped to the refill threshold. Best-effort.
+func (c *Circuit) maybeSendStreamSendme(streamID uint16) {
+	c.mu.Lock()
+	s, ok := c.streams[streamID]
+	if !ok {
+		c.mu.Unlock()
+		return
+	}
+	if s.deliverWindow > STREAMWINDOW_START-STREAMWINDOW_INCREMENT {
+		c.mu.Unlock()
+		return
+	}
+	s.deliverWindow += STREAMWINDOW_INCREMENT
+	if s.deliverWindow > STREAMWINDOW_START {
+		s.deliverWindow = STREAMWINDOW_START
+	}
+	c.mu.Unlock()
+	// Stream-level SENDME body is empty (v1 stream SENDMEs carry no tag).
+	_ = c.sendRelay(context.Background(), torcell.RelaySendme, streamID, nil, false)
 }
 
 // OpenStream opens a new application stream through the circuit's exit,
@@ -448,11 +687,18 @@ func (c *Circuit) OpenStream(ctx context.Context, target string) (*Stream, error
 	}
 	id := c.nextStream
 	c.nextStream += 2 // stream IDs are even when chosen by the client
-	s := &Stream{ID: id, circ: c, in: make(chan *torcell.RelayCell, 32)}
+	s := &Stream{
+		ID:            id,
+		circ:          c,
+		in:            make(chan *torcell.RelayCell, 32),
+		packageWindow: STREAMWINDOW_START,
+		deliverWindow: STREAMWINDOW_START,
+	}
 	c.streams[id] = s
 	c.mu.Unlock()
 
-	// RELAY_BEGIN payload: "host:port\0".
+	// RELAY_BEGIN payload: "host:port\0" followed by optional flags. We send
+	// the basic form (no IPv6 / hostname flags), matching the common case.
 	beginPayload := append([]byte(target), 0)
 	if err := c.sendRelay(ctx, torcell.RelayBegin, id, beginPayload, false); err != nil {
 		c.removeStream(id)
@@ -472,7 +718,7 @@ func (c *Circuit) OpenStream(ctx context.Context, target string) (*Stream, error
 			}
 			if rc.Header.Command == torcell.RelayEnd {
 				c.removeStream(id)
-				return nil, fmt.Errorf("circuit: stream ended (reason %d)", firstByte(rc.Payload))
+				return nil, endReasonToError(endReasonFromPayload(rc.Payload))
 			}
 		case <-time.After(time.Until(deadline)):
 			c.removeStream(id)
@@ -519,6 +765,14 @@ func (s *Stream) Read() ([]byte, error) {
 		return rc.Payload, nil
 	case torcell.RelayEnd:
 		s.closed = true
+		// Map well-known END reasons to sentinel errors so the SOCKS5 layer
+		// can produce appropriate reply codes; EOF (DONE) is a normal close.
+		if err := endReasonToError(endReasonFromPayload(rc.Payload)); err != nil {
+			if errors.Is(err, errEOF) {
+				return nil, errEOF
+			}
+			return nil, err
+		}
 		return nil, errEOF
 	}
 	return nil, fmt.Errorf("stream: unexpected relay command %d", rc.Header.Command)
@@ -531,8 +785,9 @@ func (s *Stream) Close() error {
 	}
 	s.closed = true
 	s.circ.removeStream(s.ID)
-	// Best-effort END; ignore errors.
-	s.circ.sendRelay(context.Background(), torcell.RelayEnd, s.ID, []byte{0}, false)
+	// Best-effort END with reason DONE (6); ignore errors. (Reason 0 is
+	// reserved/invalid in the spec.)
+	s.circ.sendRelay(context.Background(), torcell.RelayEnd, s.ID, []byte{endReasonDone}, false)
 	return nil
 }
 
@@ -546,6 +801,161 @@ var (
 	ErrNetUnreachable  = errors.New("circuit: network unreachable")
 	ErrTTLExpired      = errors.New("circuit: TTL expired")
 )
+
+// endReasonToError maps a relay END reason to a sentinel error (or errEOF
+// for a normal DONE close). Unknown reasons map to a generic error.
+func endReasonToError(reason int) error {
+	switch reason {
+	case endReasonDone:
+		return errEOF
+	case endReasonConnectRefused:
+		return ErrConnRefused
+	case endReasonNoRoute:
+		return ErrHostUnreachable
+	case endReasonNetUnreachable:
+		return ErrNetUnreachable
+	case endReasonTimeout:
+		return ErrTTLExpired
+	case 0:
+		// Reason 0 is invalid; treat as a normal close for robustness.
+		return errEOF
+	default:
+		return fmt.Errorf("circuit: stream ended (reason %d)", reason)
+	}
+}
+
+// BeginDir opens a stream to the exit relay's directory port, issuing a
+// RELAY_BEGIN_DIR (used to fetch directory documents over a circuit). The
+// exit must have the directory cache capability; the stream behaves like a
+// normal stream once connected.
+func (c *Circuit) BeginDir(ctx context.Context) (*Stream, error) {
+	c.mu.Lock()
+	if c.closed {
+		c.mu.Unlock()
+		return nil, errors.New("circuit: closed")
+	}
+	id := c.nextStream
+	c.nextStream += 2
+	s := &Stream{
+		ID:            id,
+		circ:          c,
+		in:            make(chan *torcell.RelayCell, 32),
+		packageWindow: STREAMWINDOW_START,
+		deliverWindow: STREAMWINDOW_START,
+	}
+	c.streams[id] = s
+	c.mu.Unlock()
+
+	// RELAY_BEGIN_DIR has an empty body.
+	if err := c.sendRelay(ctx, torcell.RelayBeginDir, id, nil, false); err != nil {
+		c.removeStream(id)
+		return nil, err
+	}
+	// Wait for CONNECTED or END (same handshake as BEGIN).
+	deadline, ok := ctx.Deadline()
+	if !ok {
+		deadline = time.Now().Add(60 * time.Second)
+	}
+	for {
+		select {
+		case rc := <-s.in:
+			if rc.Header.Command == torcell.RelayConnected {
+				return s, nil
+			}
+			if rc.Header.Command == torcell.RelayEnd {
+				c.removeStream(id)
+				return nil, endReasonToError(endReasonFromPayload(rc.Payload))
+			}
+		case <-time.After(time.Until(deadline)):
+			c.removeStream(id)
+			return nil, errors.New("circuit: begin_dir connect timeout")
+		case <-ctx.Done():
+			c.removeStream(id)
+			return nil, ctx.Err()
+		}
+	}
+}
+
+// Resolve issues a RELAY_RESOLVE for a hostname and waits for RELAY_RESOLVED,
+// returning the resolved address (as a string) and the TTL. This is the
+// circuit-level DNS lookup used by SOCKS5 RESOLVE.
+func (c *Circuit) Resolve(ctx context.Context, hostname string) (string, error) {
+	c.mu.Lock()
+	if c.closed {
+		c.mu.Unlock()
+		return "", errors.New("circuit: closed")
+	}
+	id := c.nextStream
+	c.nextStream += 2
+	s := &Stream{
+		ID:            id,
+		circ:          c,
+		in:            make(chan *torcell.RelayCell, 32),
+		packageWindow: STREAMWINDOW_START,
+		deliverWindow: STREAMWINDOW_START,
+	}
+	c.streams[id] = s
+	c.mu.Unlock()
+
+	// RELAY_RESOLVE body is the hostname (no NUL terminator).
+	if err := c.sendRelay(ctx, torcell.RelayResolve, id, []byte(hostname), false); err != nil {
+		c.removeStream(id)
+		return "", err
+	}
+	deadline, ok := ctx.Deadline()
+	if !ok {
+		deadline = time.Now().Add(60 * time.Second)
+	}
+	for {
+		select {
+		case rc := <-s.in:
+			if rc.Header.Command == torcell.RelayResolved {
+				c.removeStream(id)
+				return parseResolved(rc.Payload)
+			}
+			if rc.Header.Command == torcell.RelayEnd {
+				c.removeStream(id)
+				return "", endReasonToError(endReasonFromPayload(rc.Payload))
+			}
+		case <-time.After(time.Until(deadline)):
+			c.removeStream(id)
+			return "", errors.New("circuit: resolve timeout")
+		case <-ctx.Done():
+			c.removeStream(id)
+			return "", ctx.Err()
+		}
+	}
+}
+
+// parseResolved parses a RELAY_RESOLVED payload: [type:1][len:1][addr][ttl:4].
+// type 0 = hostname, 4 = IPv4, 6 = IPv6. Returns the address as a string.
+func parseResolved(payload []byte) (string, error) {
+	if len(payload) < 2 {
+		return "", errors.New("circuit: short RESOLVED payload")
+	}
+	typ := payload[0]
+	ln := int(payload[1])
+	if len(payload) < 2+ln {
+		return "", errors.New("circuit: RESOLVED length exceeds payload")
+	}
+	addr := payload[2 : 2+ln]
+	switch typ {
+	case 4:
+		if ln != 4 {
+			return "", errors.New("circuit: bad IPv4 RESOLVED")
+		}
+		return net.IP(addr).String(), nil
+	case 6:
+		if ln != 16 {
+			return "", errors.New("circuit: bad IPv6 RESOLVED")
+		}
+		return net.IP(append([]byte(nil), addr...)).String(), nil
+	case 0:
+		return string(addr), nil
+	default:
+		return "", fmt.Errorf("circuit: unsupported RESOLVED type %d", typ)
+	}
+}
 
 // removeStream removes a stream from the circuit's map.
 func (c *Circuit) removeStream(id uint16) {
@@ -609,6 +1019,19 @@ func firstByte(b []byte) uint8 {
 func isZero32(b [32]byte) bool {
 	for _, x := range b {
 		if x != 0 {
+			return false
+		}
+	}
+	return true
+}
+
+// isZero20 reports whether a 20-byte slice is all zero.
+func isZero20(b []byte) bool {
+	if len(b) < 20 {
+		return false
+	}
+	for i := 0; i < 20; i++ {
+		if b[i] != 0 {
 			return false
 		}
 	}
