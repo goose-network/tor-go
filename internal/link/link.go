@@ -82,6 +82,11 @@ type RouterIdentity struct {
 	OnionKey [32]byte
 	// Address is the relay's IP and OR port.
 	Address string
+	// ProtoVer is the parsed protocol-versions map from the microdescriptor
+	// "pr" line (e.g. Relay=1-2 FlowCtrl=2). The circuit layer uses it to
+	// decide whether a relay supports the ntor v3 handshake (Relay>=4). Nil
+	// means the relay did not advertise protocol versions.
+	ProtoVer map[string]string
 }
 
 // Dial connects to addr over TCP, wraps it in TLS (using the Tor

@@ -100,9 +100,6 @@ type Router struct {
 	ExitPolicy *ShortPolicy
 	// IPv6ExitPolicy is the parsed IPv6 exit policy from the "p6" line.
 	IPv6ExitPolicy *ShortPolicy
-	// ProtoVer is the parsed protocol-versions map from the microdescriptor
-	// "pr" line (e.g. FlowCtrl=2 Cons=2). Nil means not advertised.
-	ProtoVer map[string]string
 	// ORPort / DirPort from the consensus "r" line.
 	ORPort  uint16
 	DirPort uint16

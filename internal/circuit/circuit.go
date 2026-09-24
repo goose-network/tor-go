@@ -100,9 +100,16 @@ type Hop struct {
 	// Crypto is the relay-crypto layer for this hop (nil until the handshake
 	// completes).
 	Crypto *relaycrypto.Layer
-	// ntorState is the in-progress ntor handshake state (nil after the hop
-	// is open).
+	// ntorState is the in-progress ntor v1 handshake state (nil after the
+	// hop is open, or nil when using ntor v3).
 	ntorState *ntor.ClientState
+	// v3State is the in-progress ntor v3 handshake state (nil after the hop
+	// is open, or nil when using ntor v1).
+	v3State *ntor.V3ClientState
+	// handshakeType records which handshake this hop is using (ntor v1 = 2,
+	// ntor v3 = 3), so finishHandshake dispatches to the right client
+	// handshake. It is set when the onionskin is created.
+	handshakeType uint16
 }
 
 // Circuit is an origin circuit built over a single link (to the guard).
@@ -193,21 +200,110 @@ func New(ctx context.Context, l *link.Link, path []link.RouterIdentity) (*Circui
 	return c, nil
 }
 
+// createOnionskin builds the CREATE2/EXTEND2 onionskin for a hop, selecting
+// the ntor v3 handshake when the relay advertises Relay>=4 (which implies
+// ntor-v3 support, PROTOVER_RELAY_NTOR_V3) and has an Ed25519 identity key,
+// and falling back to ntor v1 otherwise. It records the chosen handshake
+// type and in-progress state on the hop. It returns the onionskin bytes, the
+// handshake type (2 for ntor v1, 3 for ntor v3), and any error.
+func (c *Circuit) createOnionskin(hop *Hop) ([]byte, uint16, error) {
+	if supportsNtorV3(hop.Relay) {
+		onionskin, state, err := ntor.V3Create(hop.Relay.Ed25519ID[:], hop.Relay.OnionKey[:])
+		if err != nil {
+			return nil, 0, err
+		}
+		hop.v3State = state
+		hop.handshakeType = ntor.HandshakeTypeNtorV3
+		return onionskin, ntor.HandshakeTypeNtorV3, nil
+	}
+	onionskin, state, err := ntor.Create(hop.Relay.IDDigest[:], hop.Relay.OnionKey[:])
+	if err != nil {
+		return nil, 0, err
+	}
+	hop.ntorState = state
+	hop.handshakeType = ntor.HandshakeTypeNtor
+	return onionskin, ntor.HandshakeTypeNtor, nil
+}
+
+// supportsNtorV3 reports whether a relay supports the ntor v3 handshake. The
+// C client gates v3 on the relay advertising Relay protocol version >= 4
+// (PROTOVER_RELAY_NTOR_V3, protover.h:39), which also requires an Ed25519
+// identity key (the v3 onionskin carries the 32-byte Ed25519 ID). We require
+// both: a non-zero Ed25519ID and a Relay protocol range that includes 4.
+func supportsNtorV3(r link.RouterIdentity) bool {
+	if isZero32(r.Ed25519ID) {
+		return false
+	}
+	return relayProtoAtLeast(r.ProtoVer, "Relay", 4)
+}
+
+// relayProtoAtLeast reports whether the protocol-versions map advertises a
+// version >= want for the named protocol. The value is a range like "1-2",
+// "4", or "1-999999". An absent protocol or unparseable range returns false.
+func relayProtoAtLeast(pv map[string]string, name string, want int) bool {
+	if pv == nil {
+		return false
+	}
+	rng, ok := pv[name]
+	if !ok {
+		return false
+	}
+	lo, hi, ok := parseProtoRange(rng)
+	if !ok {
+		return false
+	}
+	return lo <= want && want <= hi
+}
+
+// parseProtoRange parses a protocol-version range string ("4", "1-2",
+// "1-999999") into its low and high bounds.
+func parseProtoRange(s string) (lo, hi int, ok bool) {
+	for i := 0; i < len(s); i++ {
+		if s[i] == '-' {
+			a, ok1 := atoi(s[:i])
+			b, ok2 := atoi(s[i+1:])
+			if !ok1 || !ok2 {
+				return 0, 0, false
+			}
+			return a, b, true
+		}
+	}
+	v, ok := atoi(s)
+	if !ok {
+		return 0, 0, false
+	}
+	return v, v, true
+}
+
+// atoi parses a non-negative decimal integer. Empty or non-numeric input is
+// not ok.
+func atoi(s string) (int, bool) {
+	if s == "" {
+		return 0, false
+	}
+	n := 0
+	for i := 0; i < len(s); i++ {
+		if s[i] < '0' || s[i] > '9' {
+			return 0, false
+		}
+		n = n*10 + int(s[i]-'0')
+	}
+	return n, true
+}
+
 // buildFirstHop sends a CREATE2 cell to the guard and processes the CREATED2
 // reply, completing the ntor handshake for the first hop.
 func (c *Circuit) buildFirstHop(ctx context.Context) error {
 	hop := c.hops[0]
-	onionskin, state, err := ntor.Create(hop.Relay.IDDigest[:], hop.Relay.OnionKey[:])
+	onionskin, hsType, err := c.createOnionskin(hop)
 	if err != nil {
 		return err
 	}
-	hop.ntorState = state
 	hop.State = HopStateAwaitingKeys
 
 	// CREATE2 payload: [handshake_type:2][handshake_len:2][onionskin].
-	// ntor handshake type is 2 (ONION_HANDSHAKE_TYPE_NTOR).
 	payload := make([]byte, 4+len(onionskin))
-	binary.BigEndian.PutUint16(payload[0:2], 2) // ntor
+	binary.BigEndian.PutUint16(payload[0:2], hsType)
 	binary.BigEndian.PutUint16(payload[2:4], uint16(len(onionskin)))
 	copy(payload[4:], onionskin)
 
@@ -232,11 +328,10 @@ func (c *Circuit) buildFirstHop(ctx context.Context) error {
 // extend it to path[i], and processes the EXTENDED2 reply.
 func (c *Circuit) extendHop(ctx context.Context, i int) error {
 	hop := c.hops[i]
-	onionskin, state, err := ntor.Create(hop.Relay.IDDigest[:], hop.Relay.OnionKey[:])
+	onionskin, hsType, err := c.createOnionskin(hop)
 	if err != nil {
 		return err
 	}
-	hop.ntorState = state
 	hop.State = HopStateAwaitingKeys
 
 	// EXTEND2 payload is a list of link specifiers followed by a CREATE2
@@ -244,7 +339,7 @@ func (c *Circuit) extendHop(ctx context.Context, i int) error {
 	// its identity digest.
 	ls, nSpecs := buildLinkSpecifiers(hop.Relay)
 	create2 := make([]byte, 4+len(onionskin))
-	binary.BigEndian.PutUint16(create2[0:2], 2) // ntor
+	binary.BigEndian.PutUint16(create2[0:2], hsType)
 	binary.BigEndian.PutUint16(create2[2:4], uint16(len(onionskin)))
 	copy(create2[4:], onionskin)
 
@@ -305,10 +400,10 @@ func buildLinkSpecifiers(r link.RouterIdentity) ([]byte, int) {
 // CREATED2/EXTENDED2 reply, derives the relay-crypto keys, and verifies KH.
 //
 // The reply payload is: [handshake_type:2][handshake_len:2][handshake_data].
-// The handshake_data for ntor is the 64-byte server reply followed by a
-// 20-byte KH authenticator (so handshake_len is 84 for the ntor v1 reply
-// used in CREATED2: actually 64 bytes reply + extra). We derive
-// TotalKeyLen bytes from the handshake and split off the trailing KH.
+// For ntor v1 the handshake_data is the 64-byte Y||MAC reply; for ntor v3 it
+// is Y(32)||AUTH(32)||enc_smsg. Both handshakes derive TotalKeyLen bytes
+// (KeyMaterialLen relay-crypto key material + KHLen rend-circ nonce), which
+// we split into the relay-crypto layer and the trailing KH authenticator.
 func (c *Circuit) finishHandshake(hop *Hop, reply []byte) error {
 	if len(reply) < 4 {
 		return errors.New("circuit: short handshake reply")
@@ -319,23 +414,34 @@ func (c *Circuit) finishHandshake(hop *Hop, reply []byte) error {
 		return errors.New("circuit: handshake length exceeds reply")
 	}
 	hsData := reply[4 : 4+int(hsLen)]
-	if hsType != 2 {
+	if hsType != hop.handshakeType {
+		return fmt.Errorf("circuit: handshake type mismatch: sent %d, reply %d", hop.handshakeType, hsType)
+	}
+
+	var keys []byte
+	var err error
+	switch hsType {
+	case ntor.HandshakeTypeNtor:
+		keys, err = hop.ntorState.ClientHandshake(hsData, relaycrypto.TotalKeyLen)
+		if err != nil {
+			return fmt.Errorf("circuit: ntor v1 client handshake: %w", err)
+		}
+	case ntor.HandshakeTypeNtorV3:
+		keys, err = hop.v3State.V3ClientHandshake(hsData, relaycrypto.TotalKeyLen)
+		if err != nil {
+			return fmt.Errorf("circuit: ntor v3 client handshake: %w", err)
+		}
+	default:
 		return fmt.Errorf("circuit: unsupported handshake type %d", hsType)
 	}
 
-	// Derive TotalKeyLen bytes: KeyMaterialLen key material + KHLen KH.
-	keys, err := hop.ntorState.ClientHandshake(hsData, relaycrypto.TotalKeyLen)
-	if err != nil {
-		return fmt.Errorf("circuit: ntor client handshake: %w", err)
-	}
-	// For the ntor v1 handshake, the server's reply is the 64-byte Y||MAC and
-	// the MAC check inside ClientHandshake is the integrity check on the
-	// handshake (it fails if the server's onion key or identity is wrong, or
-	// the reply was tampered with). The trailing KHLen bytes are the
-	// rendezvous-circuit authenticator (rend_circ_nonce in the C code), not a
-	// value the server sends back for re-comparison. We sanity-check that the
-	// derived KH is non-zero (a degenerate handshake would produce all-zero
-	// key material); a zero KH indicates a broken handshake output.
+	// The MAC/AUTH check inside the client handshake is the integrity check
+	// on the handshake (it fails if the server's onion key or identity is
+	// wrong, or the reply was tampered with). The trailing KHLen bytes are
+	// the rendezvous-circuit authenticator (rend_circ_nonce in the C code),
+	// not a value the server sends back for re-comparison. We sanity-check
+	// that the derived KH is non-zero (a degenerate handshake would produce
+	// all-zero key material); a zero KH indicates a broken handshake output.
 	kh := keys[relaycrypto.KeyMaterialLen:]
 	if isZero20(kh) {
 		return errors.New("circuit: ntor handshake produced zero KH (degenerate handshake)")
@@ -347,6 +453,7 @@ func (c *Circuit) finishHandshake(hop *Hop, reply []byte) error {
 	}
 	hop.Crypto = layer
 	hop.ntorState = nil
+	hop.v3State = nil
 	hop.State = HopStateOpen
 	return nil
 }
