@@ -15,6 +15,7 @@ import (
 	"encoding/binary"
 	"errors"
 	"fmt"
+	"log"
 	"net"
 	"sync"
 	"time"
@@ -65,6 +66,14 @@ type Link struct {
 	// (RSA identity digest + ed25519 identity). It is set during the
 	// handshake if the relay presented a valid cert chain.
 	peerID *peerIdentity
+
+	// peerTimestamp is the timestamp the peer reported in its NETINFO cell,
+	// and clockSkew is now - peerTimestamp (positive = our clock is ahead).
+	// They are set when the server's NETINFO is received. A |clockSkew|
+	// exceeding netinfoNoticeSkew (1 hour) is logged as a warning,
+	// mirroring channel_tls_process_netinfo_cell (channeltls.c:1962).
+	peerTimestamp time.Time
+	clockSkew     time.Duration
 }
 
 // RouterIdentity is the 20-byte SHA-1 identity digest of a relay, plus its
@@ -269,7 +278,9 @@ func (l *Link) consumeHandshakeCells(ctx context.Context) error {
 		case *torcell.Cell:
 			if c.Command == torcell.CellNetinfo {
 				// Server sent NETINFO before us; that's fine. We still send
-				// ours. Stash it so awaitNetinfo is satisfied.
+				// ours. Stash it so awaitNetinfo is satisfied, and record
+				// the peer's timestamp / clock skew.
+				l.handleNetinfo(c.Payload[:])
 				l.gotNetinfo = true
 				// Fall through to CERTS verification before returning.
 				return l.verifyPeerCerts(certsPayload)
@@ -338,12 +349,53 @@ func (l *Link) awaitNetinfo(ctx context.Context) error {
 		switch c := msg.(type) {
 		case *torcell.Cell:
 			if c.Command == torcell.CellNetinfo {
+				l.handleNetinfo(c.Payload[:])
 				return nil
 			}
 		case *torcell.VarCell:
 			// ignore
 		}
 	}
+}
+
+// netinfoNoticeSkew is the minimum |clock skew| (in seconds) inferred from a
+// NETINFO cell that triggers a warning, matching NETINFO_NOTICE_SKEW
+// (channeltls.c:1961).
+const netinfoNoticeSkew = 3600
+
+// handleNetinfo parses the peer's NETINFO cell payload for its timestamp and
+// records the apparent clock skew, logging a warning if it exceeds one hour.
+// This mirrors channel_tls_process_netinfo_cell (channeltls.c:1856): the
+// skew is only meaningful if we sent our VERSIONS cell recently (within 180s),
+// which is always true here since handleNetinfo is called during the
+// handshake. The timestamp is the first 4 bytes of the payload (big-endian
+// seconds since the epoch). A malformed payload (too short) is ignored: the
+// cell still satisfies the handshake, but no skew is recorded.
+func (l *Link) handleNetinfo(payload []byte) {
+	if len(payload) < 4 {
+		return
+	}
+	ts := binary.BigEndian.Uint32(payload[0:4])
+	l.peerTimestamp = time.Unix(int64(ts), 0)
+	now := time.Now()
+	l.clockSkew = now.Sub(l.peerTimestamp)
+	if absDuration(l.clockSkew) > netinfoNoticeSkew*time.Second {
+		// Log a human-readable skew (e.g. "3601s ahead"/"3601s behind").
+		rel := "ahead"
+		if l.clockSkew < 0 {
+			rel = "behind"
+		}
+		log.Printf("link: NETINFO clock skew warning: peer timestamp %s, our clock is %s %s",
+			l.peerTimestamp.Format(time.RFC3339), absDuration(l.clockSkew), rel)
+	}
+}
+
+// absDuration returns the absolute value of d.
+func absDuration(d time.Duration) time.Duration {
+	if d < 0 {
+		return -d
+	}
+	return d
 }
 
 // sendNetinfo sends a NETINFO cell with our timestamp, the peer's observed
