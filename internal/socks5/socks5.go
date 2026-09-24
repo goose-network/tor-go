@@ -87,6 +87,15 @@ type Server struct {
 	wg     sync.WaitGroup
 	mu     sync.Mutex
 	closed bool
+
+	// RejectPrivateAddresses, when set, refuses CONNECT/RESOLVE/RESOLVE_PTR
+	// targets that are private, loopback, or link-local addresses (and the
+	// "localhost"/"*.local" hostnames), mirroring the C client's
+	// ClientRejectInternalAddresses (connection_edge.c:2380). This prevents
+	// a misconfigured application from tunneling to a private address
+	// through Tor. Off by default so loopback test targets and explicit
+	// private destinations are still allowed; the real client enables it.
+	RejectPrivateAddresses bool
 }
 
 // New returns a SOCKS5 server bound to addr that routes through dialer.
@@ -298,6 +307,30 @@ func (s *Server) handleConnect(ctx context.Context, conn net.Conn, host string, 
 		return
 	}
 
+	// Refuse connections to port 0 (connection_edge.c: "Application asked to
+	// connect to port 0. Refusing.").
+	if port == 0 {
+		log.Printf("socks5: refusing CONNECT to port 0")
+		reply(conn, repNotAllowed, nil, 0)
+		return
+	}
+
+	// Reject private/loopback/link-local destinations, mirroring the C
+	// client's ClientRejectInternalAddresses check (connection_edge.c:2380).
+	// Without a chosen exit, connecting to a private address is almost
+	// certainly a misconfiguration (or a loop), so we fail it at the SOCKS
+	// layer rather than tunneling it through Tor. Hostnames that are IP
+	// literals are checked directly; "localhost"/"local"/"*.local" are
+	// rejected too (tor_addr_hostname_is_local). Non-IP hostnames are
+	// allowed (the exit resolves them and applies its own exit policy).
+	// Gated on RejectPrivateAddresses (off by default; the real client
+	// enables it) so loopback test targets still work.
+	if s.RejectPrivateAddresses && rejectPrivateTarget(host) {
+		log.Printf("socks5: refusing private/local target %s", target)
+		reply(conn, repNotAllowed, nil, 0)
+		return
+	}
+
 	stream, err := s.dialer.DialStream(ctx, target)
 	if err != nil {
 		log.Printf("socks5: dial %s failed: %v", target, err)
@@ -319,10 +352,88 @@ func isOnionHost(host string) bool {
 	return strings.HasSuffix(strings.ToLower(host), ".onion")
 }
 
+// rejectPrivateTarget reports whether a CONNECT/RESOLVE target should be
+// refused at the SOCKS layer as a private or local address. It mirrors the
+// C client's ClientRejectInternalAddresses path (connection_edge.c:2380):
+// the "localhost"/"local"/"*.local" hostnames (tor_addr_hostname_is_local)
+// and any IP literal that tor_addr_is_internal_ considers internal. A
+// non-IP hostname is allowed (the exit resolves it and enforces its exit
+// policy). Returns false for an empty host (handled elsewhere).
+func rejectPrivateTarget(host string) bool {
+	if host == "" {
+		return false
+	}
+	// Hostname-form local addresses.
+	lower := strings.ToLower(host)
+	if lower == "localhost" || lower == "local" || strings.HasSuffix(lower, ".local") {
+		return true
+	}
+	// IP literal?
+	ip := net.ParseIP(host)
+	if ip == nil {
+		return false // hostname: let the exit resolve and apply policy
+	}
+	return isInternalIP(ip)
+}
+
+// isInternalIP reports whether ip is an internal (private/loopback/link-
+// local) address, mirroring tor_addr_is_internal_ (address.c:255) with
+// for_listening=0. IPv4 rules: 0/8, 10/8, 127/8, 100.64/10, 169.254/16,
+// 172.16/12, 192.168/16. IPv6 rules: fc00/7 (RFC 4193), fe80/10 and
+// fec0/10 (link-local / deprecated site-local), and ::/127 (loopback).
+// IPv4-mapped IPv6 addresses are reduced to their IPv4 form first.
+func isInternalIP(ip net.IP) bool {
+	if v4 := ip.To4(); v4 != nil {
+		// Treat as IPv4 (also covers IPv4-mapped IPv6).
+		o0, o1 := v4[0], v4[1]
+		switch {
+		case o0 == 0, // 0/8
+			o0 == 10, // 10/8
+			o0 == 127, // 127/8
+			o0 == 100 && o1 >= 64 && o1 <= 127, // 100.64/10
+			o0 == 169 && o1 == 254, // 169.254/16
+			o0 == 172 && o1 >= 16 && o1 <= 31, // 172.16/12
+			o0 == 192 && o1 == 168: // 192.168/16
+			return true
+		}
+		return false
+	}
+	v6 := ip.To16()
+	if v6 == nil {
+		return true // unknown family: treat as unsafe (matches C fallback)
+	}
+	// IPv6 (not v4-mapped). Compare on the first 32-bit word.
+	w0 := uint32(v6[0])<<24 | uint32(v6[1])<<16 | uint32(v6[2])<<8 | uint32(v6[3])
+	// fc00/7  -> (w0 & 0xfe000000) == 0xfc000000
+	if (w0 & 0xfe000000) == 0xfc000000 {
+		return true
+	}
+	// fe80/10 -> (w0 & 0xffc00000) == 0xfe800000
+	if (w0 & 0xffc00000) == 0xfe800000 {
+		return true
+	}
+	// fec0/10 -> (w0 & 0xffc00000) == 0xfec00000
+	if (w0 & 0xffc00000) == 0xfec00000 {
+		return true
+	}
+	// ::/127 loopback: all-zero except the last bit.
+	if w0 == 0 && v6[4] == 0 && v6[5] == 0 && v6[6] == 0 && v6[7] == 0 &&
+		v6[8] == 0 && v6[9] == 0 && v6[10] == 0 && v6[11] == 0 &&
+		v6[12] == 0 && v6[13] == 0 && v6[14] == 0 && v6[15] <= 1 {
+		return true
+	}
+	return false
+}
+
 // handleResolve performs a SOCKS5 RESOLVE (Tor extension): resolve hostname
 // through the Tor exit and reply with the address.
 func (s *Server) handleResolve(ctx context.Context, conn net.Conn, host string) {
 	log.Printf("socks5: RESOLVE %s", host)
+	if s.RejectPrivateAddresses && rejectPrivateTarget(host) {
+		log.Printf("socks5: refusing RESOLVE of private/local target %s", host)
+		reply(conn, repNotAllowed, nil, 0)
+		return
+	}
 	addr, err := s.dialer.Resolve(ctx, host)
 	if err != nil {
 		log.Printf("socks5: resolve %s failed: %v", host, err)
@@ -341,6 +452,11 @@ func (s *Server) handleResolve(ctx context.Context, conn net.Conn, host string) 
 // resolve an IP to a hostname through the Tor exit.
 func (s *Server) handleResolvePtr(ctx context.Context, conn net.Conn, host string) {
 	log.Printf("socks5: RESOLVE_PTR %s", host)
+	if s.RejectPrivateAddresses && rejectPrivateTarget(host) {
+		log.Printf("socks5: refusing RESOLVE_PTR of private/local target %s", host)
+		reply(conn, repNotAllowed, nil, 0)
+		return
+	}
 	name, err := s.dialer.ResolvePtr(ctx, host)
 	if err != nil {
 		log.Printf("socks5: resolve_ptr %s failed: %v", host, err)

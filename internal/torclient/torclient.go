@@ -65,6 +65,12 @@ type Config struct {
 	// but FetchOptions is nil, the refresh uses default authorities and the
 	// client's UpstreamProxy. Set VerifySignatures here for real-network use.
 	FetchOptions *directory.FetchOptions
+	// AllowPrivateAddresses, when false (the default), makes the SOCKS5
+	// server refuse CONNECT/RESOLVE/RESOLVE_PTR targets that are private,
+	// loopback, or link-local addresses, mirroring the C client's
+	// ClientRejectInternalAddresses. Set to true to allow explicit private
+	// destinations (e.g. for testing through a loopback exit).
+	AllowPrivateAddresses bool
 }
 
 // Client is a running Tor client.
@@ -127,6 +133,9 @@ func New(ctx context.Context, cfg *Config) (*Client, error) {
 
 	c := &Client{cfg: cfg, dir: cfg.Directory, guard: guardRouter, guards: guards}
 	c.socks = socks5.New(cfg.SocksAddr, &dialer{client: c})
+	// Reject private/loopback/link-local SOCKS targets by default (the C
+	// client's ClientRejectInternalAddresses); opt out with AllowPrivateAddresses.
+	c.socks.RejectPrivateAddresses = !cfg.AllowPrivateAddresses
 	return c, nil
 }
 

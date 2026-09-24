@@ -108,12 +108,13 @@ func TestE2ESocks5Proxy(t *testing.T) {
 	socksLn.Close()
 
 	cfg := &torclient.Config{
-		SocksAddr:           socksAddr,
-		PathLen:             3,
-		Directory:           dir,
-		Guard:               dir[fmt.Sprintf("%x", h.GuardEntry().IDDigest[:])],
-		LinkDialTimeout:     10 * time.Second,
-		CircuitBuildTimeout: 15 * time.Second,
+		SocksAddr:             socksAddr,
+		PathLen:               3,
+		Directory:             dir,
+		Guard:                 dir[fmt.Sprintf("%x", h.GuardEntry().IDDigest[:])],
+		LinkDialTimeout:       10 * time.Second,
+		CircuitBuildTimeout:   15 * time.Second,
+		AllowPrivateAddresses: true, // mock-relay e2e targets a loopback origin server
 	}
 	ctx, cancel := context.WithTimeout(context.Background(), 60*time.Second)
 	defer cancel()
@@ -176,12 +177,13 @@ func TestE2ESocks5ProxyRefused(t *testing.T) {
 	socksLn.Close()
 
 	cfg := &torclient.Config{
-		SocksAddr:           socksAddr,
-		PathLen:             3,
-		Directory:           dir,
-		Guard:               dir[fmt.Sprintf("%x", h.GuardEntry().IDDigest[:])],
-		LinkDialTimeout:     10 * time.Second,
-		CircuitBuildTimeout: 15 * time.Second,
+		SocksAddr:             socksAddr,
+		PathLen:               3,
+		Directory:             dir,
+		Guard:                 dir[fmt.Sprintf("%x", h.GuardEntry().IDDigest[:])],
+		LinkDialTimeout:       10 * time.Second,
+		CircuitBuildTimeout:   15 * time.Second,
+		AllowPrivateAddresses: true, // mock-relay e2e targets a loopback origin server
 	}
 	ctx, cancel := context.WithTimeout(context.Background(), 60*time.Second)
 	defer cancel()
