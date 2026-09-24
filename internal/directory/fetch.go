@@ -100,6 +100,16 @@ type FetchOptions struct {
 	// download_status failure schedule. The overall Timeout still bounds
 	// the total attempt time.
 	Retries int
+	// UseFallbacks, when true, bootstraps the consensus over a one-hop
+	// CREATE_FAST circuit to a fallback directory cache (see
+	// internal/fallback) instead of over HTTPS to a directory authority. This
+	// is the C client's primary bootstrap path: it contacts a hardcoded
+	// fallback relay's ORPort over TLS (verifying the relay's RSA identity
+	// digest), builds a one-hop fast circuit, and fetches the consensus and
+	// microdescriptors with BEGIN_DIR over that circuit. Fallbacks are tried
+	// in order until one succeeds. When false (the default), the HTTPS
+	// authority path is used.
+	UseFallbacks bool
 }
 
 // Fetch downloads a real microconsensus and its microdescriptors, parses them,
@@ -126,6 +136,14 @@ func FetchWithMeta(ctx context.Context, opts FetchOptions) (map[string]*Router, 
 	}
 	ctx, cancel := context.WithTimeout(ctx, opts.Timeout)
 	defer cancel()
+
+	// When the fallback path is selected, bootstrap the consensus and
+	// microdescriptors over a one-hop CREATE_FAST circuit to a fallback
+	// directory cache. This is the C client's primary bootstrap path and does
+	// not use the HTTPS authority transport at all.
+	if opts.UseFallbacks {
+		return fetchViaFallbackCircuit(ctx, opts)
+	}
 
 	client := &http.Client{Transport: &dialTransport{upstream: opts.UpstreamProxy}, Timeout: 0}
 

@@ -33,6 +33,7 @@ import (
 	"sync"
 	"time"
 
+	"github.com/proxy/tor-go/internal/fast"
 	"github.com/proxy/tor-go/internal/ntor"
 	"github.com/proxy/tor-go/internal/relaycrypto"
 	"github.com/proxy/tor-go/internal/torcell"
@@ -333,6 +334,8 @@ func (r *MockRelay) cellLoop(conn net.Conn, codec *torcell.Codec) {
 		switch cell.Command {
 		case torcell.CellCreate2:
 			r.handleCreate2(codec, cell)
+		case torcell.CellCreateFast:
+			r.handleCreateFast(codec, cell)
 		case torcell.CellRelay, torcell.CellRelayEarly:
 			r.handleRelay(conn, codec, cell)
 		case torcell.CellDestroy:
@@ -390,6 +393,39 @@ func (r *MockRelay) handleCreate2(codec *torcell.Codec, cell *torcell.Cell) {
 	copy(created2[4:], reply)
 	out := &torcell.Cell{CircID: cell.CircID, Command: torcell.CellCreated2}
 	copy(out.Payload[:], created2)
+	codec.WriteCell(out)
+}
+
+// handleCreateFast processes a CREATE_FAST: run the CREATE_FAST server
+// handshake, store the relay-crypto layer, and reply CREATED_FAST. The
+// onionskin is the raw 20-byte client nonce and the reply is the raw 40-byte
+// y||H(x||y) (no type/length prefix), matching the client's
+// buildFirstHopFast/finishFastHandshake.
+func (r *MockRelay) handleCreateFast(codec *torcell.Codec, cell *torcell.Cell) {
+	onionskin := cell.Payload[:fast.NonceLen]
+	reply, keys, err := fast.ServerHandshake(onionskin, relaycrypto.TotalKeyLen)
+	if err != nil {
+		log.Printf("testharness %s: CREATE_FAST server handshake: %v", r.cfg.Nickname, err)
+		r.sendDestroy(codec, cell.CircID, torcell.DestroyReasonInternal)
+		return
+	}
+	// Reversed layer: the relay's forward = client's backward.
+	layer, err := relaycrypto.NewLayerReversed(keys[:relaycrypto.KeyMaterialLen])
+	if err != nil {
+		r.sendDestroy(codec, cell.CircID, torcell.DestroyReasonInternal)
+		return
+	}
+	rc := &relayCircuit{
+		circID:  cell.CircID,
+		layer:   layer,
+		streams: make(map[uint16]*relayStream),
+	}
+	r.mu.Lock()
+	r.circuits[cell.CircID] = rc
+	r.mu.Unlock()
+
+	out := &torcell.Cell{CircID: cell.CircID, Command: torcell.CellCreatedFast}
+	copy(out.Payload[:], reply)
 	codec.WriteCell(out)
 }
 
@@ -624,8 +660,9 @@ func (r *MockRelay) pipeFromTarget(codec *torcell.Codec, rc *relayCircuit, strea
 			r.sendRelayBackward(codec, rc, streamID, torcell.RelayData, buf[:n])
 		}
 		if err != nil {
-			// Send END (reason 1 = DONE) and clean up.
-			r.sendRelayBackward(codec, rc, streamID, torcell.RelayEnd, []byte{1})
+			// Send END with reason DONE (6) for a normal close and clean up.
+			// (Reason 1 is MISC, not DONE; the client maps DONE to EOF.)
+			r.sendRelayBackward(codec, rc, streamID, torcell.RelayEnd, []byte{6})
 			rc.mu.Lock()
 			delete(rc.streams, streamID)
 			rc.mu.Unlock()

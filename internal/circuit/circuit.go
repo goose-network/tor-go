@@ -17,6 +17,7 @@ import (
 	"sync"
 	"time"
 
+	"github.com/proxy/tor-go/internal/fast"
 	"github.com/proxy/tor-go/internal/link"
 	"github.com/proxy/tor-go/internal/ntor"
 	"github.com/proxy/tor-go/internal/relaycrypto"
@@ -31,6 +32,12 @@ const (
 	HopStateAwaitingKeys
 	HopStateOpen
 )
+
+// handshakeTypeFast is the sentinel handshake-type value used to dispatch
+// CREATE_FAST in finishHandshake. CREATE_FAST does not appear in the CREATE2
+// handshake-type space (it has its own cell commands, CREATE_FAST/CREATED_FAST),
+// so this value is only ever compared against itself.
+const handshakeTypeFast uint16 = 0
 
 // Flow-control window constants, matching src/core/or/or.h. The client tracks
 // two windows per circuit and per stream:
@@ -106,9 +113,15 @@ type Hop struct {
 	// v3State is the in-progress ntor v3 handshake state (nil after the hop
 	// is open, or nil when using ntor v1).
 	v3State *ntor.V3ClientState
+	// fastState is the in-progress CREATE_FAST handshake state (nil unless
+	// this hop was built with NewOneHopFast). CREATE_FAST is only valid for a
+	// first hop to a trusted directory cache whose identity is verified by the
+	// TLS link, so it has no handshake-type id in the CREATE2 space; we use
+	// the sentinel handshakeTypeFast to dispatch in finishHandshake.
+	fastState *fast.State
 	// handshakeType records which handshake this hop is using (ntor v1 = 2,
-	// ntor v3 = 3), so finishHandshake dispatches to the right client
-	// handshake. It is set when the onionskin is created.
+	// ntor v3 = 3, CREATE_FAST = 0), so finishHandshake dispatches to the
+	// right client handshake. It is set when the onionskin is created.
 	handshakeType uint16
 }
 
@@ -200,6 +213,50 @@ func New(ctx context.Context, l *link.Link, path []link.RouterIdentity) (*Circui
 			c.teardown()
 			return nil, fmt.Errorf("circuit: hop %d: %w", i+1, err)
 		}
+	}
+	go c.readLoop()
+	return c, nil
+}
+
+// NewOneHopFast builds a one-hop circuit over an already-established link l
+// using the CREATE_FAST handshake (CellCreateFast/CellCreatedFast) instead of
+// CREATE2/CREATED2. The single hop is the relay l is connected to.
+//
+// CREATE_FAST is unauthenticated and non-forward-secure: it derives circuit
+// keys from the client and server nonces alone, with no relay onion key. It is
+// therefore only safe as the first (and here only) hop, where the TLS link to
+// the relay already authenticates it and protects the handshake from
+// eavesdroppers. This is exactly how the C client bootstraps a one-hop
+// directory-fetch circuit to a fallback directory or authority whose onion key
+// it does not yet know (circuitbuild.c:circuit_establish_circuit,
+// onion_fast.c). The caller is responsible for having verified the relay's
+// identity (e.g. via link.DialWithUpstream with an expected RSA digest) before
+// calling this.
+func NewOneHopFast(ctx context.Context, l *link.Link) (*Circuit, error) {
+	circID, in, err := l.Register()
+	if err != nil {
+		return nil, err
+	}
+	c := &Circuit{
+		link:                l,
+		circID:              circID,
+		in:                  in,
+		streams:             make(map[uint16]*Stream),
+		nextStream:          1,
+		done:                make(chan struct{}),
+		packageWindow:       CIRCWINDOW_START,
+		deliverWindow:       CIRCWINDOW_START,
+		remainingRelayEarly: MaxRelayEarlyCellsPerCircuit,
+	}
+	// A one-hop fast circuit has a single hop. The hop's Relay identity is
+	// not needed: CREATE_FAST carries no identity material (it relies on the
+	// already-verified TLS link), and there are no further hops to extend to.
+	// We record an empty identity for bookkeeping only.
+	c.hops = []*Hop{{State: HopStateClosed}}
+
+	if err := c.buildFirstHopFast(ctx); err != nil {
+		c.teardown()
+		return nil, fmt.Errorf("circuit: fast first hop: %w", err)
 	}
 	go c.readLoop()
 	return c, nil
@@ -327,6 +384,66 @@ func (c *Circuit) buildFirstHop(ctx context.Context) error {
 		return err
 	}
 	return c.finishHandshake(hop, reply.Payload[:])
+}
+
+// buildFirstHopFast sends a CREATE_FAST cell to the link peer and processes
+// the CREATED_FAST reply, completing the CREATE_FAST handshake for the single
+// hop of a one-hop fast circuit. Unlike buildFirstHop, the onionskin is the
+// raw 20-byte client nonce (no CREATE2 type/length prefix) and the reply is
+// the raw 40-byte y||H(x||y) (no CREATED2 prefix). This mirrors
+// circuit_send_next_onion_skin (circuitbuild.c) for the CREATE_FAST path.
+func (c *Circuit) buildFirstHopFast(ctx context.Context) error {
+	hop := c.hops[0]
+	onionskin, state, err := fast.Create()
+	if err != nil {
+		return err
+	}
+	hop.fastState = state
+	hop.handshakeType = handshakeTypeFast
+	hop.State = HopStateAwaitingKeys
+
+	cell := &torcell.Cell{
+		CircID:  c.circID,
+		Command: torcell.CellCreateFast,
+	}
+	copy(cell.Payload[:], onionskin)
+	if err := c.link.Send(cell); err != nil {
+		return err
+	}
+
+	// Wait for CREATED_FAST.
+	reply, err := c.awaitCell(ctx, torcell.CellCreatedFast)
+	if err != nil {
+		return err
+	}
+	return c.finishFastHandshake(hop, reply.Payload[:])
+}
+
+// finishFastHandshake completes the CREATE_FAST handshake for a hop using the
+// server's CREATED_FAST reply (the raw 40-byte y||H(x||y)), derives the
+// relay-crypto keys, and installs the crypto layer. The CREATE_FAST key
+// expansion produces TotalKeyLen bytes (KeyMaterialLen relay-crypto key
+// material + KHLen rend-circ nonce), split the same way as the ntor path.
+// The integrity check inside fast.ClientHandshake is the authentication of
+// the handshake (it fails if the reply is tampered with); the trailing KH is
+// sanity-checked for non-zero, as in finishHandshake.
+func (c *Circuit) finishFastHandshake(hop *Hop, reply []byte) error {
+	keys, err := hop.fastState.ClientHandshake(reply, relaycrypto.TotalKeyLen)
+	if err != nil {
+		return fmt.Errorf("circuit: CREATE_FAST client handshake: %w", err)
+	}
+	kh := keys[relaycrypto.KeyMaterialLen:]
+	if isZero20(kh) {
+		return errors.New("circuit: CREATE_FAST produced zero KH (degenerate handshake)")
+	}
+	layer, err := relaycrypto.NewLayer(keys[:relaycrypto.KeyMaterialLen])
+	if err != nil {
+		return err
+	}
+	hop.Crypto = layer
+	hop.fastState = nil
+	hop.State = HopStateOpen
+	return nil
 }
 
 // extendHop sends an EXTEND2 relay cell through the existing circuit to
@@ -942,7 +1059,14 @@ func (s *Stream) Close() error {
 	return nil
 }
 
-var errEOF = errors.New("stream: EOF")
+// ErrEOF is returned by Stream.Read when the stream is closed normally
+// (RELAY_END with reason DONE). It is the stream's end-of-stream signal;
+// callers reading until EOF should stop on errors.Is(err, ErrEOF).
+var ErrEOF = errors.New("stream: EOF")
+
+// errEOF is an alias kept for the existing internal call sites; new code
+// should use ErrEOF.
+var errEOF = ErrEOF
 
 // Sentinel errors mapped from relay END reasons, used by the SOCKS5 layer to
 // produce appropriate reply codes.
