@@ -12,13 +12,14 @@ reads the C source as a reference and reimplements the protocols in Go.
 
 - Module: `github.com/goose-network/tor-go`
 - Go version: toolchain 1.27.1, but the `go` directive is **1.26.0** so the
-  goose repo (which `plugins/tor` is built into, via require+replace) can
-  co-build with `GOTOOLCHAIN=go1.26.8` — psiphon-tls panics at init under
-  Go 1.27.x. Build goose with
+  goose repo (which `plugins/tor` is built into) can co-build with
+  `GOTOOLCHAIN=go1.26.8` — psiphon-tls panics at init under Go 1.27.x. Build
+  goose with
   `cd /home/ubuntu/Downloads/proxy/goose && GOTOOLCHAIN=go1.26.8 go build ./cmd/goose`.
 - External dependencies: `golang.org/x/crypto` (curve25519, hkdf, sha3) plus
-  the local `goose-plugin-api` contract module (require + replace, imported
-  only by `plugins/tor`).
+  `github.com/goose-network/goose-plugin-api` (the published contract module,
+  imported only by `plugins/tor` — no local replace; tor-go itself is
+  published as v0.0.2 and required by goose the same way).
 - Entry point: `cmd/tor-go/main.go` — loads a directory (consensus +
   microdescriptors) from files, or bootstraps one over the network
   (`-fetch-dir`), then serves a SOCKS5 proxy applications connect to.
