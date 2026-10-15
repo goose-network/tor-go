@@ -1,7 +1,8 @@
 # Package reference
 
-This document is a per-package reference for `tor-go`'s `internal/` packages and
-the `cmd/tor-go` entry point. Packages are listed bottom-up in dependency order
+This document is a per-package reference for `tor-go`'s `internal/` packages,
+the `cmd/tor-go` entry point, and the `plugins/tor` goose provider plugin.
+Packages are listed bottom-up in dependency order
 (wire format and crypto primitives first, then the layers that compose them,
 then the top-level client and the test harness). For each package it gives the
 purpose, the C reference file(s) it mirrors, the key exported API, and notable
@@ -477,3 +478,30 @@ usually skipped.
 directory), `-upstream` (SOCKS5 dial-through), `-fetch-dir` (bootstrap a real
 directory over the network). Exactly one directory source must be chosen:
 `-fetch-dir`, `-mock-dir`, or the `-consensus` + `-microdescriptors` pair.
+
+## plugins/tor
+
+**Purpose:** the goose proxy-pool engine's `tor` provider plugin. It embeds
+the client packages as a library, bootstraps a real Tor client (directory
+fetch, guard link, SOCKS5 listener) in a background goroutine with
+exponential-backoff retries, and contributes one `socks5` outbound at the
+client's loopback listener once it is serving; `Watch()` signals the
+readiness flip so the engine repolls promptly. The consensus is re-fetched
+hourly while serving. It lives inside this module (not a separate repo)
+because it embeds `internal/torclient` and `internal/directory`; on the goose
+side it imports only `goose-plugin-api`, preserving the plugin import
+boundary.
+
+**Mirrors:** none (plugin adapter).
+
+**Exported API:** `New(map[string]any) (plugin.Provider, error)` — registered
+as `"tor"` via `plugin.RegisterProvider` in `init()`.
+
+**Config keys:** `upstream_proxy`, `path_len`, `socks_listen` (default
+ephemeral), `outbound_id` (default `"tor"`), `fetch_timeout_seconds`
+(default 300), `max_microdescs`, `verify_signatures` (default **true** — the
+quorum is the only consensus authentication, since dirports are plain HTTP),
+`use_fallbacks` (incompatible with `verify_signatures`),
+`link_dial_timeout_seconds`, `circuit_build_timeout_seconds`,
+`allow_private_addresses`. See `plugins/tor/README.md` for the full table
+and a goose config example.

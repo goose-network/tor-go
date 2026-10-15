@@ -171,11 +171,27 @@ Key `Config` fields (from the struct comments in
 | `FetchOptions`           | Configures the background consensus refresh / `RefreshDirectory`. Set `VerifySignatures` for real use. |
 | `AllowPrivateAddresses`  | When false (default), refuse SOCKS5 targets that are private/loopback/link-local.                 |
 
+## goose provider plugin
+
+tor-go doubles as the engine behind the `tor` provider of the
+[goose](https://github.com/goose-network/goose) proxy-pool engine: the
+plugin in [`plugins/tor`](plugins/tor) embeds this module's client packages,
+bootstraps a real Tor client in the background, and contributes one `socks5`
+outbound at tor-go's loopback listener once it is serving. It is published as
+the versioned module `github.com/goose-network/tor-go`; goose requires it
+directly from the module proxy (no local `replace`) and blank-imports
+`plugins/tor` to register the provider.
+
+The provider config surface (upstream proxy, path length, signature
+verification, fallback bootstrap, timeouts, ...) and a full example config
+are documented in [`plugins/tor/README.md`](plugins/tor/README.md).
+
 ## Project layout
 
 ```
 tor-go/
 ├── cmd/tor-go/          # Standalone Tor client command (loads a directory, serves SOCKS5)
+├── plugins/tor/         # goose provider plugin: embeds the client, exposes one socks5 outbound
 └── internal/
     ├── torclient/       # Top-level client: owns directory, guard link, circuit pool, SOCKS5 listener
     ├── socks5/          # SOCKS5 (RFC 1928) proxy server; CONNECT/RESOLVE/RESOLVE_PTR with no-auth + userpass

@@ -45,6 +45,11 @@ Support packages sit alongside these layers:
 - **torcell** — the on-the-wire cell format and command constants.
 - **testharness** — an in-process mock relay for end-to-end tests.
 
+One consumer sits outside the protocol stack: **plugins/tor**, the goose
+proxy-pool engine's provider plugin, which embeds the whole stack as a
+library and exposes it as a single `socks5` outbound (see
+`plugins/tor/README.md`).
+
 ## Data flow of a SOCKS5 CONNECT
 
 A request from an application (e.g. `curl --socks5-hostname 127.0.0.1:1080`)

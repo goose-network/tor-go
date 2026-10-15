@@ -19,7 +19,7 @@ reads the C source as a reference and reimplements the protocols in Go.
 - External dependencies: `golang.org/x/crypto` (curve25519, hkdf, sha3) plus
   `github.com/goose-network/goose-plugin-api` (the published contract module,
   imported only by `plugins/tor` — no local replace; tor-go itself is
-  published as v0.0.2 and required by goose the same way).
+  published as v0.0.3 and required by goose the same way).
 - Entry point: `cmd/tor-go/main.go` — loads a directory (consensus +
   microdescriptors) from files, or bootstraps one over the network
   (`-fetch-dir`), then serves a SOCKS5 proxy applications connect to.
