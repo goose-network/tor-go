@@ -21,11 +21,11 @@ import (
 	"sync"
 	"time"
 
-	"github.com/proxy/tor-go/internal/circuit"
-	"github.com/proxy/tor-go/internal/directory"
-	"github.com/proxy/tor-go/internal/guard"
-	"github.com/proxy/tor-go/internal/link"
-	"github.com/proxy/tor-go/internal/socks5"
+	"github.com/goose-network/tor-go/internal/circuit"
+	"github.com/goose-network/tor-go/internal/directory"
+	"github.com/goose-network/tor-go/internal/guard"
+	"github.com/goose-network/tor-go/internal/link"
+	"github.com/goose-network/tor-go/internal/socks5"
 )
 
 // Config configures the Tor client.

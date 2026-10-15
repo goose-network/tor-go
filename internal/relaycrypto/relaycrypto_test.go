@@ -4,7 +4,7 @@ import (
 	"bytes"
 	"testing"
 
-	"github.com/proxy/tor-go/internal/torcell"
+	"github.com/goose-network/tor-go/internal/torcell"
 )
 
 func TestNewLayerKeyLayout(t *testing.T) {

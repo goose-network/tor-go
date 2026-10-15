@@ -8,8 +8,8 @@ import (
 	"testing"
 	"time"
 
-	"github.com/proxy/tor-go/internal/proxy"
-	"github.com/proxy/tor-go/internal/socks5"
+	"github.com/goose-network/tor-go/internal/proxy"
+	"github.com/goose-network/tor-go/internal/socks5"
 )
 
 // echoListener starts a TCP echo server on an ephemeral port and returns its

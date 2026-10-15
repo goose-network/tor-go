@@ -31,8 +31,8 @@ import (
 	"testing"
 	"time"
 
-	"github.com/proxy/tor-go/internal/directory"
-	"github.com/proxy/tor-go/internal/torclient"
+	"github.com/goose-network/tor-go/internal/directory"
+	"github.com/goose-network/tor-go/internal/torclient"
 )
 
 // upstreamProxy is the SOCKS5 proxy tor-go dials through to reach the real

@@ -5,7 +5,7 @@ import (
 	"encoding/base64"
 	"fmt"
 
-	"github.com/proxy/tor-go/internal/link"
+	"github.com/goose-network/tor-go/internal/link"
 )
 
 // MockDirectory returns a small synthetic directory of relays for testing.

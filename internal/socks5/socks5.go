@@ -23,7 +23,7 @@ import (
 	"sync"
 	"time"
 
-	"github.com/proxy/tor-go/internal/circuit"
+	"github.com/goose-network/tor-go/internal/circuit"
 )
 
 // requestTimeout is the default deadline for opening a Tor stream.

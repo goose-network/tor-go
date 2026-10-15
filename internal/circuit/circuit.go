@@ -17,11 +17,11 @@ import (
 	"sync"
 	"time"
 
-	"github.com/proxy/tor-go/internal/fast"
-	"github.com/proxy/tor-go/internal/link"
-	"github.com/proxy/tor-go/internal/ntor"
-	"github.com/proxy/tor-go/internal/relaycrypto"
-	"github.com/proxy/tor-go/internal/torcell"
+	"github.com/goose-network/tor-go/internal/fast"
+	"github.com/goose-network/tor-go/internal/link"
+	"github.com/goose-network/tor-go/internal/ntor"
+	"github.com/goose-network/tor-go/internal/relaycrypto"
+	"github.com/goose-network/tor-go/internal/torcell"
 )
 
 // HopState is the state of a single hop during circuit building.

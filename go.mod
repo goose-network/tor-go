@@ -1,4 +1,4 @@
-module github.com/proxy/tor-go
+module github.com/goose-network/tor-go
 
 go 1.26.0
 

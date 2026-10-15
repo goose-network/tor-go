@@ -10,9 +10,9 @@ import (
 	"net/http"
 	"strings"
 
-	"github.com/proxy/tor-go/internal/circuit"
-	"github.com/proxy/tor-go/internal/fallback"
-	"github.com/proxy/tor-go/internal/link"
+	"github.com/goose-network/tor-go/internal/circuit"
+	"github.com/goose-network/tor-go/internal/fallback"
+	"github.com/goose-network/tor-go/internal/link"
 )
 
 // fetchViaFallbackCircuit bootstraps the microconsensus and microdescriptors

@@ -24,7 +24,7 @@ import (
 	"strings"
 	"time"
 
-	"github.com/proxy/tor-go/internal/proxy"
+	"github.com/goose-network/tor-go/internal/proxy"
 )
 
 // DirectoryAuthority is a source for directory documents. The URLs point at

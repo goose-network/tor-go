@@ -20,7 +20,7 @@ import (
 	"errors"
 	"hash"
 
-	"github.com/proxy/tor-go/internal/torcell"
+	"github.com/goose-network/tor-go/internal/torcell"
 )
 
 // Key material layout produced by the ntor handshake for a single hop

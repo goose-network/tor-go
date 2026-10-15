@@ -11,9 +11,9 @@ import (
 	"testing"
 	"time"
 
-	"github.com/proxy/tor-go/internal/directory"
-	"github.com/proxy/tor-go/internal/testharness"
-	"github.com/proxy/tor-go/internal/torclient"
+	"github.com/goose-network/tor-go/internal/directory"
+	"github.com/goose-network/tor-go/internal/testharness"
+	"github.com/goose-network/tor-go/internal/torclient"
 )
 
 // socks5Dial performs a SOCKS5 CONNECT to target through the proxy at

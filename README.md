@@ -132,8 +132,8 @@ package main
 
 import (
     "context"
-    "github.com/proxy/tor-go/internal/directory"
-    "github.com/proxy/tor-go/internal/torclient"
+    "github.com/goose-network/tor-go/internal/directory"
+    "github.com/goose-network/tor-go/internal/torclient"
 )
 
 func main() {

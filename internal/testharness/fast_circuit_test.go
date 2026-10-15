@@ -11,9 +11,9 @@ import (
 	"testing"
 	"time"
 
-	"github.com/proxy/tor-go/internal/circuit"
-	"github.com/proxy/tor-go/internal/link"
-	"github.com/proxy/tor-go/internal/testharness"
+	"github.com/goose-network/tor-go/internal/circuit"
+	"github.com/goose-network/tor-go/internal/link"
+	"github.com/goose-network/tor-go/internal/testharness"
 )
 
 // TestOneHopFastCircuit verifies the CREATE_FAST one-hop circuit path: it

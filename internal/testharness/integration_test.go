@@ -9,10 +9,10 @@ import (
 	"testing"
 	"time"
 
-	"github.com/proxy/tor-go/internal/circuit"
-	"github.com/proxy/tor-go/internal/directory"
-	"github.com/proxy/tor-go/internal/link"
-	"github.com/proxy/tor-go/internal/testharness"
+	"github.com/goose-network/tor-go/internal/circuit"
+	"github.com/goose-network/tor-go/internal/directory"
+	"github.com/goose-network/tor-go/internal/link"
+	"github.com/goose-network/tor-go/internal/testharness"
 )
 
 // buildDir converts a harness's directory entries into a directory.Router map

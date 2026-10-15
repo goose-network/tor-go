@@ -10,7 +10,7 @@ reference implementation at `/home/ubuntu/Downloads/proxy/tor` (Tor
 0.4.9.x). It is a clean-room port: the two repos share **no code**. tor-go
 reads the C source as a reference and reimplements the protocols in Go.
 
-- Module: `github.com/proxy/tor-go`
+- Module: `github.com/goose-network/tor-go`
 - Go version: toolchain 1.27.1, but the `go` directive is **1.26.0** so the
   goose repo (which `plugins/tor` is built into, via require+replace) can
   co-build with `GOTOOLCHAIN=go1.26.8` — psiphon-tls panics at init under

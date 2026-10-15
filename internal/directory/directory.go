@@ -23,7 +23,7 @@ import (
 	"strings"
 	"time"
 
-	"github.com/proxy/tor-go/internal/link"
+	"github.com/goose-network/tor-go/internal/link"
 )
 
 // ConsensusMeta holds the validity timestamps parsed from a consensus

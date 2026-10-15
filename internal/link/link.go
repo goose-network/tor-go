@@ -20,8 +20,8 @@ import (
 	"sync"
 	"time"
 
-	"github.com/proxy/tor-go/internal/proxy"
-	"github.com/proxy/tor-go/internal/torcell"
+	"github.com/goose-network/tor-go/internal/proxy"
+	"github.com/goose-network/tor-go/internal/torcell"
 )
 
 // sha1Of returns the SHA-1 digest of b.
