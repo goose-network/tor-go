@@ -11,8 +11,14 @@ reference implementation at `/home/ubuntu/Downloads/proxy/tor` (Tor
 reads the C source as a reference and reimplements the protocols in Go.
 
 - Module: `github.com/proxy/tor-go`
-- Go version: 1.27.1
-- Only external dependency: `golang.org/x/crypto` (curve25519, hkdf, sha3).
+- Go version: toolchain 1.27.1, but the `go` directive is **1.26.0** so the
+  goose repo (which `plugins/tor` is built into, via require+replace) can
+  co-build with `GOTOOLCHAIN=go1.26.8` — psiphon-tls panics at init under
+  Go 1.27.x. Build goose with
+  `cd /home/ubuntu/Downloads/proxy/goose && GOTOOLCHAIN=go1.26.8 go build ./cmd/goose`.
+- External dependencies: `golang.org/x/crypto` (curve25519, hkdf, sha3) plus
+  the local `goose-plugin-api` contract module (require + replace, imported
+  only by `plugins/tor`).
 - Entry point: `cmd/tor-go/main.go` — loads a directory (consensus +
   microdescriptors) from files, or bootstraps one over the network
   (`-fetch-dir`), then serves a SOCKS5 proxy applications connect to.
@@ -92,6 +98,7 @@ that note when editing.
 | `internal/relaycrypto` | Layered AES-128-CTR + SHA-1 running-digest relay-cell crypto. | `src/core/crypto/relay_crypto_tor1.c`, `relay_crypto.c` |
 | `internal/torcell` | Wire cell format + cell/relay command constants. | `src/core/or/or.h`, `cell_st.h` |
 | `internal/testharness` | In-process mock relay (full server-side reimplementation) for e2e tests. | (test-only; no C mirror) |
+| `plugins/tor` | goose provider plugin: wraps tor-go as a `tor` provider for the goose proxy-pool engine (embeds internal/torclient + internal/directory, exposes one `socks5` outbound at tor-go's loopback listener). | (plugin adapter; no C mirror) |
 
 ## Key conventions
 

@@ -3,6 +3,7 @@ package directory
 import (
 	"bufio"
 	"context"
+	"encoding/base64"
 	"errors"
 	"fmt"
 	"io"
@@ -27,7 +28,8 @@ import (
 //
 // The directory protocol over BEGIN_DIR is HTTP/1.1 to the relay's directory
 // port (which BEGIN_DIR reaches internally): GET /tor/status-vote/current/
-// consensus-microdesc for the consensus and GET /tor/micro/d/<hex> for each
+// consensus-microdesc for the consensus and GET /tor/micro/d/<unpadded-base64
+// sha256> for each
 // microdescriptor. The response is plain HTTP (no TLS — the TLS terminates at
 // the relay, and the circuit's onion encryption protects the body in transit).
 func fetchViaFallbackCircuit(ctx context.Context, opts FetchOptions) (map[string]*Router, *ConsensusMeta, error) {
@@ -53,7 +55,7 @@ func fetchFromOneFallback(ctx context.Context, opts FetchOptions, fb fallback.Fa
 	// The TLS link authenticates the relay; CREATE_FAST then derives circuit
 	// keys without needing the relay's onion key (which the fallback list
 	// does not carry).
-	l, err := link.DialWithUpstream(ctx, opts.UpstreamProxy, addr, fb.RSAFingerprint[:])
+	l, err := link.DialWithUpstream(ctx, opts.UpstreamProxy, addr, fb.RSAFingerprint[:], [32]byte{})
 	if err != nil {
 		return nil, nil, fmt.Errorf("dial fallback %s: %w", fb.HexFingerprint(), err)
 	}
@@ -91,12 +93,16 @@ func fetchFromOneFallback(ctx context.Context, opts FetchOptions, fb fallback.Fa
 	// allows pipelining requests on a single BEGIN_DIR stream, but to keep
 	// the read loop simple we fetch them sequentially.
 	type job struct {
-		hex string
+		b64 string
 		r   *Router
 	}
 	var jobs []job
 	for _, r := range routers {
-		jobs = append(jobs, job{fmt.Sprintf("%x", r.MicrodescDigest[:]), r})
+		// Same encoding as fetch.go: the dirport takes the raw unpadded
+		// base64 SHA-256 token from the consensus "m" line (dircache.c:
+		// DSR_DIGEST256 | DSR_BASE64; a hex digest is silently dropped
+		// from the spool and the request 404s).
+		jobs = append(jobs, job{base64.RawStdEncoding.EncodeToString(r.MicrodescDigest[:]), r})
 		if opts.MaxMicrodescs > 0 && len(jobs) >= opts.MaxMicrodescs {
 			break
 		}
@@ -104,7 +110,7 @@ func fetchFromOneFallback(ctx context.Context, opts FetchOptions, fb fallback.Fa
 	var mdBuf strings.Builder
 	fetched := 0
 	for _, j := range jobs {
-		body, err := httpGetOverStream(ctx, stream, "/tor/micro/d/"+j.hex, addr)
+		body, err := httpGetOverStream(ctx, stream, "/tor/micro/d/"+j.b64, addr)
 		if err != nil {
 			continue
 		}

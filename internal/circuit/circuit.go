@@ -128,16 +128,16 @@ type Hop struct {
 // Circuit is an origin circuit built over a single link (to the guard).
 // Additional hops are extended through the guard.
 type Circuit struct {
-	link  *link.Link
+	link   *link.Link
 	circID uint32
-	in    <-chan *torcell.Cell
+	in     <-chan *torcell.Cell
 
-	mu      sync.Mutex
-	hops    []*Hop
-	streams map[uint16]*Stream
+	mu         sync.Mutex
+	hops       []*Hop
+	streams    map[uint16]*Stream
 	nextStream uint16
-	closed  bool
-	done    chan struct{}
+	closed     bool
+	done       chan struct{}
 
 	// Flow control. packageWindow is the number of cells we may still send
 	// toward the exit (decremented on each outgoing DATA, refilled by inbound
@@ -159,10 +159,10 @@ type Circuit struct {
 
 // Stream is an application stream multiplexed over a circuit.
 type Stream struct {
-	ID      uint16
-	circ    *Circuit
-	in      chan *torcell.RelayCell
-	closed  bool
+	ID     uint16
+	circ   *Circuit
+	in     chan *torcell.RelayCell
+	closed bool
 
 	// BoundAddr is the address the exit bound the stream to, parsed from the
 	// RELAY_CONNECTED reply (an IPv4 or IPv6 literal). Empty until the stream
@@ -187,14 +187,14 @@ func New(ctx context.Context, l *link.Link, path []link.RouterIdentity) (*Circui
 		return nil, err
 	}
 	c := &Circuit{
-		link:               l,
-		circID:             circID,
-		in:                 in,
-		streams:            make(map[uint16]*Stream),
-		nextStream:         1,
-		done:               make(chan struct{}),
-		packageWindow:      CIRCWINDOW_START,
-		deliverWindow:      CIRCWINDOW_START,
+		link:                l,
+		circID:              circID,
+		in:                  in,
+		streams:             make(map[uint16]*Stream),
+		nextStream:          1,
+		done:                make(chan struct{}),
+		packageWindow:       CIRCWINDOW_START,
+		deliverWindow:       CIRCWINDOW_START,
 		remainingRelayEarly: MaxRelayEarlyCellsPerCircuit,
 	}
 	c.hops = make([]*Hop, len(path))
@@ -457,8 +457,8 @@ func (c *Circuit) extendHop(ctx context.Context, i int) error {
 	hop.State = HopStateAwaitingKeys
 
 	// EXTEND2 payload is a list of link specifiers followed by a CREATE2
-	// payload. We send one link specifier: the relay's IPv4 address+port and
-	// its identity digest.
+	// payload. We send the relay's IPv4 ORPort, its RSA identity digest and
+	// (when known) its ed25519 identity as link specifiers.
 	ls, nSpecs := buildLinkSpecifiers(hop.Relay)
 	create2 := make([]byte, 4+len(onionskin))
 	binary.BigEndian.PutUint16(create2[0:2], hsType)
@@ -487,29 +487,40 @@ func (c *Circuit) extendHop(ctx context.Context, i int) error {
 }
 
 // buildLinkSpecifiers builds the link specifier list for an EXTEND2 cell.
-// Each specifier is [type:1][len:1][data]. We include:
-//   - type 1 (IPv4+port): 4 bytes IP + 2 bytes port
-//   - type 2 (legacy RSA identity digest): 20 bytes
-//   - type 3 (ed25519 identity): 32 bytes
+// Each specifier is [type:1][len:1][data]. The type codes come from the
+// trunnel link_specifier union (ed25519_cert.trunnel; LS_* in
+// src/trunnel/ed25519_cert.h):
+//
+//	0 (LS_IPV4): 4 bytes IP + 2 bytes port — len 6
+//	1 (LS_IPV6): 16 bytes IP + 2 bytes port — len 18
+//	2 (LS_LEGACY_ID): 20-byte RSA identity digest
+//	3 (LS_ED25519_ID): 32-byte ed25519 identity
+//
+// We include the relay's IPv4 ORPort, its RSA digest, and — when known — its
+// ed25519 identity, matching extend_cell_format's EXTEND2 branch (onion.c),
+// which sends the ed25519 specifier whenever should_include_ed25519_id_extend_
+// cells() is true (consensus param ExtendByEd25519ID, currently 1 network-wide)
+// and the key is non-zero; the guard fills it in from its own consensus
+// otherwise (circuit_extend_add_ed25519_helper).
 //
 // It returns the concatenated specifier bytes and the number of specifiers.
 func buildLinkSpecifiers(r link.RouterIdentity) ([]byte, int) {
 	var out []byte
 	n := 0
-	// IPv4 + port.
+	// IPv4 + port (type 0, LS_IPV4).
 	ip := parseIP(r.Address)
 	if v4 := ip.To4(); v4 != nil {
 		port := parsePort(r.Address)
-		out = append(out, 1, 6)
+		out = append(out, 0, 6)
 		out = append(out, v4...)
 		out = append(out, byte(port>>8), byte(port))
 		n++
 	}
-	// Legacy identity digest (type 2).
+	// Legacy identity digest (type 2, LS_LEGACY_ID).
 	out = append(out, 2, 20)
 	out = append(out, r.IDDigest[:]...)
 	n++
-	// Ed25519 identity (type 3), if non-zero.
+	// Ed25519 identity (type 3, LS_ED25519_ID), if non-zero.
 	if !isZero32(r.Ed25519ID) {
 		out = append(out, 3, 32)
 		out = append(out, r.Ed25519ID[:]...)
@@ -521,28 +532,32 @@ func buildLinkSpecifiers(r link.RouterIdentity) ([]byte, int) {
 // finishHandshake completes the ntor handshake for a hop using the server's
 // CREATED2/EXTENDED2 reply, derives the relay-crypto keys, and verifies KH.
 //
-// The reply payload is: [handshake_type:2][handshake_len:2][handshake_data].
-// For ntor v1 the handshake_data is the 64-byte Y||MAC reply; for ntor v3 it
-// is Y(32)||AUTH(32)||enc_smsg. Both handshakes derive TotalKeyLen bytes
+// The reply payload is [handshake_len:2][handshake_data] — with no
+// handshake-type field. Only the CREATE2/EXTEND2 request carries
+// [handshake_type:2][handshake_len:2][data] (the create2_cell_body trunnel
+// struct); the reply is framed by created_cell_format / extended_cell_format
+// (onion.c), which write htons(handshake_len) followed by the raw reply
+// bytes, and parsed back by created_cell_parse / extended_cell_parse. For
+// ntor v1 the handshake_data is the 64-byte Y||MAC reply; for ntor v3 it is
+// Y(32)||AUTH(32)||enc_smsg. Both handshakes derive TotalKeyLen bytes
 // (KeyMaterialLen relay-crypto key material + KHLen rend-circ nonce), which
 // we split into the relay-crypto layer and the trailing KH authenticator.
 func (c *Circuit) finishHandshake(hop *Hop, reply []byte) error {
-	if len(reply) < 4 {
+	if len(reply) < 2 {
 		return errors.New("circuit: short handshake reply")
 	}
-	hsType := binary.BigEndian.Uint16(reply[0:2])
-	hsLen := binary.BigEndian.Uint16(reply[2:4])
-	if int(hsLen) > len(reply)-4 {
+	hsLen := binary.BigEndian.Uint16(reply[0:2])
+	if int(hsLen) > len(reply)-2 {
 		return errors.New("circuit: handshake length exceeds reply")
 	}
-	hsData := reply[4 : 4+int(hsLen)]
-	if hsType != hop.handshakeType {
-		return fmt.Errorf("circuit: handshake type mismatch: sent %d, reply %d", hop.handshakeType, hsType)
-	}
+	hsData := reply[2 : 2+int(hsLen)]
+	// The reply does not echo the handshake type — created2_cell_parse has no
+	// such field on the reply — so dispatch on the type we sent; each
+	// handshake below validates the reply bytes cryptographically anyway.
 
 	var keys []byte
 	var err error
-	switch hsType {
+	switch hop.handshakeType {
 	case ntor.HandshakeTypeNtor:
 		keys, err = hop.ntorState.ClientHandshake(hsData, relaycrypto.TotalKeyLen)
 		if err != nil {
@@ -554,7 +569,7 @@ func (c *Circuit) finishHandshake(hop *Hop, reply []byte) error {
 			return fmt.Errorf("circuit: ntor v3 client handshake: %w", err)
 		}
 	default:
-		return fmt.Errorf("circuit: unsupported handshake type %d", hsType)
+		return fmt.Errorf("circuit: unsupported handshake type %d", hop.handshakeType)
 	}
 
 	// The MAC/AUTH check inside the client handshake is the integrity check
@@ -840,10 +855,7 @@ func (c *Circuit) dispatchRelay(rc *torcell.RelayCell) {
 		if !ok {
 			return
 		}
-		select {
-		case s.in <- rc:
-		default:
-		}
+		c.tryDeliver(s, rc)
 	case torcell.RelayConnected, torcell.RelayEnd, torcell.RelayResolved:
 		c.mu.Lock()
 		s, ok := c.streams[rc.Header.StreamID]
@@ -851,10 +863,7 @@ func (c *Circuit) dispatchRelay(rc *torcell.RelayCell) {
 		if !ok {
 			return
 		}
-		select {
-		case s.in <- rc:
-		default:
-		}
+		c.tryDeliver(s, rc)
 	case torcell.RelaySendme:
 		// A circuit-level SENDME (streamID == 0) refills our package window.
 		// A stream-level SENDME (streamID != 0) refills that stream's package
@@ -1233,14 +1242,44 @@ func parseResolved(payload []byte) (string, error) {
 	}
 }
 
-// removeStream removes a stream from the circuit's map.
+// removeStream removes a stream from the circuit's map. The stream's inbound
+// channel is NOT closed here — a closed channel would turn tryDeliver's
+// non-blocking send into a panic if a DATA cell were still in flight for the
+// stream on the readLoop goroutine; deletion alone makes tryDeliver skip it.
 func (c *Circuit) removeStream(id uint16) {
 	c.mu.Lock()
 	delete(c.streams, id)
 	c.mu.Unlock()
 }
 
-// closeAllStreams closes every stream on the circuit.
+// tryDeliver hands a decrypted relay cell to a stream without blocking,
+// tolerating the stream having been removed (or the circuit torn down and
+// s.in closed) between the caller's map lookup and this send. Sending on a
+// closed channel would panic even inside a select, so re-check under the
+// circuit lock that the stream is still registered — closeAllStreams closes
+// s.in and empties the map in the same critical section, and removeStream
+// deletes without closing, so "still in the map" implies "channel open".
+func (c *Circuit) tryDeliver(s *Stream, rc *torcell.RelayCell) {
+	c.mu.Lock()
+	current, ok := c.streams[s.ID]
+	c.mu.Unlock()
+	if !ok || current != s {
+		return
+	}
+	select {
+	case s.in <- rc:
+	default:
+	}
+}
+
+// closeAllStreams closes every stream on the circuit. It runs from
+// Circuit.Close (the SOCKS-serving goroutine, racing the circuit's readLoop)
+// or from readLoop after a DESTROY. Closing s.in is safe against a racing
+// tryDeliver because both the close and the map-removal happen under the
+// same c.mu, and tryDeliver re-checks the stream is still registered under
+// that lock before sending — a sender either sees the stream in the map with
+// an open channel, or not in the map and skips the send. A DATA cell for a
+// stream that closeAllStreams removed is dropped with the stream.
 func (c *Circuit) closeAllStreams() {
 	c.mu.Lock()
 	c.closed = true
@@ -1382,6 +1421,7 @@ func stringsIndex(s, b string) int {
 //   - empty payload: no address (returns "");
 //   - 4-byte IPv4 (big-endian) [+ 4-byte TTL];
 //   - 4 zero bytes + type 6 + 16-byte IPv6 + 4-byte TTL.
+//
 // It returns the address as a string ("1.2.3.4" or "::1") and ignores the
 // TTL. A malformed payload yields an empty string (the stream is still
 // considered connected; the address is best-effort).

@@ -75,16 +75,22 @@ type Config struct {
 
 // Client is a running Tor client.
 type Client struct {
-	cfg    *Config
-	mu     sync.Mutex
-	link   *link.Link
-	dir    map[string]*directory.Router
-	guard  *directory.Router
+	cfg   *Config
+	mu    sync.Mutex
+	link  *link.Link
+	dir   map[string]*directory.Router
+	guard *directory.Router
 	// guards is the prop271 guard-selection state machine. It is nil when the
 	// caller pinned a specific guard via Config.Guard (no failover).
 	guards *guard.Manager
 	socks  *socks5.Server
 	closed bool
+	// dialMu serializes guard (re)dials (Connect). The check-link / dial /
+	// store-link sequence in Connect must not interleave: two concurrent
+	// redialGuard calls (keep-alive tick + a request hitting a dead link)
+	// would otherwise both dial and clobber c.link, leaking the loser's TLS
+	// connection and its readLoop goroutine.
+	dialMu sync.Mutex
 }
 
 // New validates the config and prepares the client. It does not connect to
@@ -196,6 +202,12 @@ func hexIDDigest(r *directory.Router) string {
 // guard is marked failed and the next guard is tried, up to a small number of
 // attempts. A successful connection confirms the guard in the manager.
 func (c *Client) Connect(ctx context.Context) error {
+	// Single-flight: hold dialMu across the check-and-dial so a concurrent
+	// redialGuard (keep-alive tick and/or a request that found a dead link)
+	// either finds the link already renewed by the winner or runs its own
+	// dial only after the previous attempt fully finished.
+	c.dialMu.Lock()
+	defer c.dialMu.Unlock()
 	c.mu.Lock()
 	if c.link != nil {
 		c.mu.Unlock()
@@ -244,12 +256,16 @@ func (c *Client) Connect(ctx context.Context) error {
 func (c *Client) dialGuard(ctx context.Context, r *directory.Router, guardID string) error {
 	dctx, cancel := context.WithTimeout(ctx, c.cfg.LinkDialTimeout)
 	defer cancel()
-	l, err := link.DialWithUpstream(dctx, c.cfg.UpstreamProxy, r.Address, r.IDDigest[:])
+	l, err := link.DialWithUpstream(dctx, c.cfg.UpstreamProxy, r.Address, r.IDDigest[:], r.Ed25519ID)
 	if err != nil {
 		return fmt.Errorf("connect to guard %s: %w", r.Address, err)
 	}
 	c.mu.Lock()
 	c.link = l
+	// Record the dialed relay as the active guard so buildPath always
+	// handshakes with the identity of the relay the link actually goes to
+	// (prop271 failover or a redial may land on a different guard than the
+	// one New selected; hop 1's CREATE2 onionskin is keyed by c.guard).
 	c.guard = r
 	c.mu.Unlock()
 	if guardID != "" {
@@ -260,6 +276,68 @@ func (c *Client) dialGuard(ctx context.Context, r *directory.Router, guardID str
 	return nil
 }
 
+// keepAliveLoop keeps the guard link from being reaped while the client is
+// otherwise idle. Upstream SOCKS5 proxies in front of the Tor network
+// (Clash/mihomo &c.) commonly drop tunnels that carry no packets for a few
+// minutes; a Tor channel that is not building circuits sends nothing, so the
+// first request after a quiet period finds a dead tunnel (observed as a
+// broken pipe on the next write, or a timeout waiting for CREATED2).
+//
+// The C client negotiates channel padding with the relay for exactly this
+// purpose (channelpadding.c). Here we send an unsolicited PADDING cell every
+// keepAliveInterval while the link is up and idle; relays accept and drop
+// padding cells (command.c's default case), and the traffic keeps every hop
+// of the tunnel — upstream proxy, NAT, the guard itself — from seeing an
+// idle connection. If padding reveals the link has died, a fresh guard link
+// is dialed in the background so subsequent requests find a live tunnel.
+//
+// The loop runs on a context derived from Serve's, so it stops when Serve
+// exits; it also gives up on a closed client.
+func (c *Client) keepAliveLoop(ctx context.Context) {
+	const keepAliveInterval = 60 * time.Second
+	t := time.NewTicker(keepAliveInterval)
+	defer t.Stop()
+	for {
+		select {
+		case <-ctx.Done():
+			return
+		case <-t.C:
+		}
+		c.mu.Lock()
+		closed := c.closed
+		l := c.link
+		c.mu.Unlock()
+		if closed {
+			return
+		}
+		if l == nil || !l.IsAlive() {
+			c.redialGuard(ctx)
+			continue
+		}
+		if err := l.SendPadding(); err != nil {
+			log.Printf("torclient: guard link keep-alive failed: %v; redialing", err)
+			c.redialGuard(ctx)
+		}
+	}
+}
+
+// redialGuard replaces a dead guard link with a fresh one, reusing the
+// provider's guard-failover machinery. It hops circuits onto the new link on
+// their next dial; in-flight circuits on the old link fail (their cells were
+// undeliverable anyway).
+func (c *Client) redialGuard(ctx context.Context) {
+	c.mu.Lock()
+	old := c.link
+	c.link = nil
+	c.mu.Unlock()
+	if old != nil {
+		old.Close()
+	}
+	if err := c.Connect(ctx); err != nil {
+		log.Printf("torclient: guard redial failed: %v", err)
+	}
+}
+
 // Serve connects to the guard (if not already connected) and serves the
 // SOCKS5 proxy until the context is cancelled. If RefreshInterval is set, it
 // also runs a background consensus refresh that periodically re-fetches the
@@ -268,6 +346,13 @@ func (c *Client) Serve(ctx context.Context) error {
 	if err := c.Connect(ctx); err != nil {
 		return err
 	}
+	// Keep the guard link alive (padding) and self-healing (redial on
+	// death) while serving; see keepAliveLoop. The keep-alive runs on a
+	// context derived from Serve's so it never outlives Serve (an abandoned
+	// loop would redial the guard network for a client nobody serves).
+	kctx, kcancel := context.WithCancel(ctx)
+	defer kcancel()
+	go c.keepAliveLoop(kctx)
 	if c.cfg.RefreshInterval > 0 {
 		go c.refreshLoop(ctx)
 	}
@@ -365,6 +450,18 @@ func (d *dialer) DialStream(ctx context.Context, target string) (io.ReadWriteClo
 	c.mu.Unlock()
 	if l == nil {
 		return nil, errors.New("torclient: not connected to guard")
+	}
+	if !l.IsAlive() {
+		// The tunnel died while we were idle (see keepAliveLoop). Redial
+		// synchronously so this request gets a fresh link instead of
+		// failing with a write to a broken pipe.
+		c.redialGuard(ctx)
+		c.mu.Lock()
+		l = c.link
+		c.mu.Unlock()
+		if l == nil {
+			return nil, errors.New("torclient: guard link lost and redial failed")
+		}
 	}
 
 	path, err := c.buildPath()
@@ -536,5 +633,12 @@ func hexNibble(n byte) byte {
 // Guard returns the selected guard relay.
 func (c *Client) Guard() *directory.Router { return c.guard }
 
-// SocksAddr returns the configured SOCKS5 listen address.
-func (c *Client) SocksAddr() string { return c.cfg.SocksAddr }
+// SocksAddr returns the address the SOCKS5 listener is serving on: the
+// bound address once ListenAndServe has run (so "127.0.0.1:0" resolves to
+// the real ephemeral port), or the configured address before that.
+func (c *Client) SocksAddr() string {
+	if a := c.socks.Addr(); a != nil {
+		return a.String()
+	}
+	return c.cfg.SocksAddr
+}

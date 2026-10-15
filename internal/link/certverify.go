@@ -19,7 +19,6 @@ package link
 
 import (
 	"bytes"
-	"crypto"
 	"crypto/ed25519"
 	"crypto/rsa"
 	"crypto/sha1"
@@ -28,18 +27,19 @@ import (
 	"encoding/binary"
 	"errors"
 	"fmt"
+	"math/big"
 	"time"
 )
 
 // CERTS cell cert types (link_handshake.h).
 const (
-	certTypeRSA1024IDLink  = 1 // RSA identity + link (legacy)
-	certTypeRSA1024IDID    = 2 // RSA identity self-signed (legacy ID cert)
-	certTypeRSA1024IDAuth  = 3 // RSA identity + auth (legacy)
-	certTypeEdIDSign       = 4 // ed25519: ID signs signing key
-	certTypeEdSignLink     = 5 // ed25519: signing key signs TLS link key
-	certTypeEdSignAuth     = 6 // ed25519: signing key signs auth key
-	certTypeRSA1024IDEdID  = 7 // RSA→ed25519 cross-cert
+	certTypeRSA1024IDLink = 1 // RSA identity + link (legacy)
+	certTypeRSA1024IDID   = 2 // RSA identity self-signed (legacy ID cert)
+	certTypeRSA1024IDAuth = 3 // RSA identity + auth (legacy)
+	certTypeEdIDSign      = 4 // ed25519: ID signs signing key
+	certTypeEdSignLink    = 5 // ed25519: signing key signs TLS link key
+	certTypeEdSignAuth    = 6 // ed25519: signing key signs auth key
+	certTypeRSA1024IDEdID = 7 // RSA→ed25519 cross-cert
 )
 
 // ed25519 cert signed-key types (torcert.h).
@@ -57,6 +57,10 @@ const rsaEdCrosscertPrefix = "Tor TLS RSA/Ed25519 cross-certificate"
 
 // ed25519SigLen is the length of an ed25519 signature.
 const ed25519SigLen = 64
+
+// ed25519CertVersion is the only certificate version trunnel accepts
+// (u8 version IN [1]; ed25519_cert.c rejects anything else).
+const ed25519CertVersion = 1
 
 // parsedCerts holds the typed certificates extracted from a CERTS cell.
 type parsedCerts struct {
@@ -89,20 +93,41 @@ type ed25519Cert struct {
 
 // peerIdentity is the verified identity learned from a CERTS cell.
 type peerIdentity struct {
-	rsaIDDigest  [20]byte   // SHA-1 of the RSA ID cert's public key
-	ed25519ID    [32]byte   // ed25519 master identity (zero if none)
-	hasEd25519   bool
+	rsaIDDigest [20]byte // SHA-1 of the RSA ID cert's public key
+	ed25519ID   [32]byte // ed25519 master identity (zero if none)
+	hasEd25519  bool
 }
 
-// parseCertsCell parses a CERTS cell payload into typed certificates. The
-// payload is a sequence of (cert_type:1, cert_len:2, body:cert_len) entries.
-// Returns the parsed certs and nil error on success. A degenerate/empty cell
-// (no usable certs) returns (nil, nil) so the caller can fall back to the
-// legacy TLS-digest check.
+// parseCertsCell parses a CERTS cell payload into typed certificates. Per the
+// certs_cell trunnel struct (src/trunnel/link_handshake.trunnel), the payload
+// is a leading u8 n_certs count followed by n_certs entries of
+// (cert_type:1, cert_len:2, body:cert_len). Trunnel's parser fails the whole
+// cell if the entries end before n_certs (relayed failure), so we do too;
+// channeltls.c additionally rejects a truncated or duplicate certificate of
+// each type ("Duplicate x509/Ed25519 certificate"), so the same type twice
+// is an error here as well. Returns the parsed certs and nil error on
+// success. A degenerate/empty cell (no usable certs) returns (nil, nil) so
+// the caller can fall back to the legacy TLS-digest check.
 func parseCertsCell(payload []byte) (*parsedCerts, error) {
 	pc := &parsedCerts{}
+	if len(payload) < 1 {
+		return nil, nil
+	}
+	n := int(payload[0])
+	payload = payload[1:]
 	any := false
-	for len(payload) >= 3 {
+	entries := 0
+	seenTypes := map[uint8]bool{}
+	dup := func(ct uint8) bool { return seenTypes[ct] }
+	note := func(ct uint8) {
+		seenTypes[ct] = true
+		any = true
+	}
+	for entries < n {
+		if len(payload) < 3 {
+			// Entries ended before n_certs: truncated cell.
+			return nil, errors.New("link: CERTS cell truncated")
+		}
 		ct := payload[0]
 		clen := int(binary.BigEndian.Uint16(payload[1:3]))
 		payload = payload[3:]
@@ -111,6 +136,10 @@ func parseCertsCell(payload []byte) (*parsedCerts, error) {
 		}
 		body := payload[:clen]
 		payload = payload[clen:]
+		entries++
+		if dup(ct) {
+			return nil, fmt.Errorf("link: duplicate certificate type %d", ct)
+		}
 		switch ct {
 		case certTypeRSA1024IDID:
 			c, err := x509.ParseCertificate(body)
@@ -118,21 +147,21 @@ func parseCertsCell(payload []byte) (*parsedCerts, error) {
 				return nil, fmt.Errorf("link: parse RSA ID cert: %w", err)
 			}
 			pc.idCert = c
-			any = true
+			note(ct)
 		case certTypeRSA1024IDLink:
 			c, err := x509.ParseCertificate(body)
 			if err != nil {
 				return nil, fmt.Errorf("link: parse RSA link cert: %w", err)
 			}
 			pc.linkCert = c
-			any = true
+			note(ct)
 		case certTypeRSA1024IDAuth:
 			c, err := x509.ParseCertificate(body)
 			if err != nil {
 				return nil, fmt.Errorf("link: parse RSA auth cert: %w", err)
 			}
 			pc.authCert = c
-			any = true
+			note(ct)
 		case certTypeEdIDSign, certTypeEdSignLink, certTypeEdSignAuth:
 			ec, err := parseEd25519Cert(body)
 			if err != nil {
@@ -146,10 +175,10 @@ func parseCertsCell(payload []byte) (*parsedCerts, error) {
 			case certTypeEdSignAuth:
 				pc.edSignAuth = ec
 			}
-			any = true
+			note(ct)
 		case certTypeRSA1024IDEdID:
 			pc.edRSACrosscert = append([]byte(nil), body...)
-			any = true
+			note(ct)
 		}
 	}
 	if !any {
@@ -172,10 +201,12 @@ func parseEd25519Cert(encoded []byte) (*ed25519Cert, error) {
 	}
 	c := &ed25519Cert{encoded: append([]byte(nil), encoded...)}
 	r := encoded
-	if len(r) < 1 {
-		return nil, errors.New("ed25519 cert: truncated version")
+	if r[0] != ed25519CertVersion {
+		// trunnel constrains the field to IN [1]; ed25519_cert.c fails the
+		// whole cell on any other version.
+		return nil, fmt.Errorf("ed25519 cert: unsupported version %d", r[0])
 	}
-	r = r[1:] // version (unused)
+	r = r[1:] // version (checked above)
 	if len(r) < 1 {
 		return nil, errors.New("ed25519 cert: truncated cert_type")
 	}
@@ -203,30 +234,32 @@ func parseEd25519Cert(encoded []byte) (*ed25519Cert, error) {
 	nExt := int(r[0])
 	r = r[1:]
 	for i := 0; i < nExt; i++ {
-		if len(r) < 2 {
-			return nil, errors.New("ed25519 cert: truncated ext_length")
+		if len(r) < 4 {
+			return nil, errors.New("ed25519 cert: truncated ext header")
 		}
+		// ext_length counts only the union body (the bytes AFTER the u16
+		// ext_length, u8 ext_type and u8 ext_flags), matching trunnel's
+		// write-back in ed25519_cert.c (written - written_before_union).
 		extLen := int(binary.BigEndian.Uint16(r[:2]))
-		r = r[2:]
+		extType := r[2]
+		extFlags := r[3]
+		r = r[4:]
 		if extLen > len(r) {
 			return nil, errors.New("ed25519 cert: extension overruns")
 		}
-		ext := r[:extLen]
+		body := r[:extLen]
 		r = r[extLen:]
-		if len(ext) < 2 {
-			return nil, errors.New("ed25519 cert: extension too short")
-		}
-		extType := ext[0]
-		extFlags := ext[1]
 		if extType == certextSignedWithKey {
-			// The extension body after type+flags is the 32-byte signing key.
-			if len(ext) < 2+32 {
-				return nil, errors.New("ed25519 cert: signed-with-key ext too short")
+			// The signed-with-key extension body is the 32-byte signing key,
+			// exactly 32 bytes — trunnel requires the union body to be
+			// consumed entirely (ed25519_cert.c fails on remaining != 0).
+			if len(body) != 32 {
+				return nil, errors.New("ed25519 cert: signed-with-key ext must be 32 bytes")
 			}
 			if c.signingKeyIn {
 				return nil, errors.New("ed25519 cert: duplicate signing key")
 			}
-			copy(c.signingKey[:], ext[2:2+32])
+			copy(c.signingKey[:], body[:32])
 			c.signingKeyIn = true
 		} else if extFlags&certFlagIncludeSignKey != 0 {
 			// Unrecognized extension flagged as affecting validation.
@@ -370,19 +403,42 @@ func verifyCerts(pc *parsedCerts, tlsPeerCertDER []byte, now time.Time) (*peerId
 	return id, nil
 }
 
-// verifyX509Chain checks that child is signed by parent. If selfSigned is true,
-// parent==child and we verify the self-signature. This mirrors
-// tor_tls_cert_is_valid (minus the name-check, which Tor doesn't require for
-// link certs).
+// Tor's certificate-lifetime tolerances (x509_internal.h): allow certs that
+// expired up to this long ago / start up to this far in the future, treating
+// the rest as clock skew rather than a hard failure.
+const (
+	certPastSlop   = 2 * 24 * time.Hour
+	certFutureSlop = 30 * 24 * time.Hour
+)
+
+// verifyX509Chain checks whether child is signed by parent (parent==child for
+// a self-signed cert). It mirrors tor_tls_cert_is_valid (x509_nss.c:304):
+// verify the signature over the tbsCertificate with the issuer's key, then
+// check the lifetime window — unconditionally, for self-signed ID certs too
+// (torcert.c: or_handshake_certs_rsa_ok and or_handshake_certs_ed25519_ok
+// both call it with the ID cert as child and signer). Notably it does NOT
+// enforce x509 KeyUsage or BasicConstraints — Go's CheckSignatureFrom
+// rejects real relay RSA ID certs on exactly those grounds ("parent
+// certificate cannot sign this kind of cert") even though they verify fine
+// under Tor's own rules.
 func verifyX509Chain(child, parent *x509.Certificate, now time.Time, selfSigned bool) error {
-	if now.After(child.NotAfter) || now.Before(child.NotBefore) {
+	if parent == nil || child == nil {
+		return errors.New("missing certificate")
+	}
+	if now.After(child.NotAfter.Add(certPastSlop)) {
 		return errors.New("cert not valid at this time")
 	}
-	if selfSigned {
-		// Verify the self-signature.
-		return child.CheckSignatureFrom(child)
+	if now.Add(certFutureSlop).Before(child.NotBefore) {
+		return errors.New("cert not valid at this time")
 	}
-	return child.CheckSignatureFrom(parent)
+
+	// Signature over the tbsCertificate with the issuer's key only
+	// (x509_nss.c uses NSS CERT_VerifySignedDataWithPublicKey, which checks
+	// just this, not the issuer's KeyUsage/CA flags).
+	if err := parent.CheckSignature(child.SignatureAlgorithm, child.RawTBSCertificate, child.Signature); err != nil {
+		return fmt.Errorf("bad signature: %w", err)
+	}
+	return nil
 }
 
 // x509CertMatchesKey reports whether the cert's public key matches the public
@@ -422,19 +478,21 @@ func rsaPublicKeyFromCert(cert *x509.Certificate) (*rsa.PublicKey, error) {
 	return pk, nil
 }
 
-// rsaIDDigest returns the SHA-1 digest of the RSA ID cert's public key, which
-// is the relay's RSA identity fingerprint (consensus "r" line identity).
+// rsaIDDigest returns the SHA-1 digest of the RSA ID cert's public key in
+// PKCS#1 DER form (i2d_RSAPublicKey), which is the relay's RSA identity
+// fingerprint (consensus "r" line identity).
 func rsaIDDigest(cert *x509.Certificate) ([20]byte, error) {
 	pk, err := rsaPublicKeyFromCert(cert)
 	if err != nil {
 		return [20]byte{}, err
 	}
-	der, err := x509.MarshalPKIXPublicKey(pk)
-	if err != nil {
-		return [20]byte{}, err
-	}
+	der := x509.MarshalPKCS1PublicKey(pk)
 	// Tor's identity digest is SHA-1 of the ASN.1-encoded public key (the
-	// "key digest"), matching crypto_pk_get_digests / DIGEST_SHA1.
+	// "key digest"), matching crypto_pk_get_digests / DIGEST_SHA1: the C
+	// crypto_pk_asn1_encode serializes with i2d_RSAPublicKey (PKCS#1
+	// RSAPublicKey), NOT the SPKI/PKIX form x509.MarshalPKIXPublicKey
+	// produces — the two DER encodings wrap the same key material but hash
+	// differently, and only the PKCS#1 form matches the fingerprint.
 	return sha1.Sum(der), nil
 }
 
@@ -457,7 +515,13 @@ func verifyRSAEd25519Crosscert(cc []byte, rsaIDKey *rsa.PublicKey, masterEdKey [
 	if 37+sigLen > len(cc) {
 		return errors.New("crosscert signature overruns")
 	}
-	sig := cc[37 : 37+sigLen]
+	if 37+sigLen != len(cc) {
+		// C requires the encoded crosscert to be consumed exactly
+		// (torcert.c: crosscert_len != parsed_len → "Unparseable or
+		// overlong crosscert").
+		return errors.New("crosscert has trailing bytes")
+	}
+	sig := cc[37:]
 	if !bytes.Equal(edKey, masterEdKey) {
 		return errors.New("crosscert ed_key does not match master identity")
 	}
@@ -471,8 +535,55 @@ func verifyRSAEd25519Crosscert(cc []byte, rsaIDKey *rsa.PublicKey, masterEdKey [
 	h.Write([]byte(rsaEdCrosscertPrefix))
 	h.Write(cc[:36])
 	digest := h.Sum(nil)
-	if err := rsa.VerifyPKCS1v15(rsaIDKey, crypto.SHA256, digest, sig); err != nil {
-		return fmt.Errorf("crosscert RSA signature: %w", err)
+	// The signature is a raw PKCS#1 v1.5 type-1 block over the 32 digest
+	// bytes themselves — NOT a DigestInfo-wrapped hash. Trust's
+	// crypto_pk_public_checksig@NSS (PK11_VerifyRecover under CKM_RSA_PKCS)
+	// recovers the signed bytes and compares them to the digest without any
+	// DigestInfo wrap (torcert.c: rsa_ed25519_crosscert_check step -6), so
+	// Go's rsa.VerifyPKCS1v15(hash, digest) rejects valid crosscerts.
+	if !rsaVerifyRawPKCS1(rsaIDKey, digest, sig) {
+		return errors.New("crosscert RSA signature: verification failed")
 	}
 	return nil
+}
+
+// rsaVerifyRawPKCS1 checks sig against data under a raw PKCS#1 v1.5 type-1
+// padding block: sig^e mod n must be 00 01 FF…FF 00 <data>. This is what
+// crypto_pk_public_checksig does via NSS's PK11_VerifyRecover (CKM_RSA_PKCS):
+// it "recovers" the signed-to data and lets the caller compare. Standard
+// DigestInfo-wrapped verification (rsa.VerifyPKCS1v15) is not equivalent
+// because Tor signs the bare bytes.
+func rsaVerifyRawPKCS1(pub *rsa.PublicKey, data, sig []byte) bool {
+	k := (pub.N.BitLen() + 7) / 8
+	if len(sig) != k {
+		return false
+	}
+	s := new(big.Int).SetBytes(sig)
+	if s.Cmp(pub.N) >= 0 {
+		return false
+	}
+	e := big.NewInt(int64(pub.E))
+	m := new(big.Int).Exp(s, e, pub.N)
+	em := m.Bytes()
+	// Left-pad to the modulus size.
+	if len(em) < k {
+		padded := make([]byte, k)
+		copy(padded[k-len(em):], em)
+		em = padded
+	}
+	// 00 01 FF... FF 00 <data>
+	if len(em) < len(data)+11 {
+		return false
+	}
+	if em[0] != 0x00 || em[1] != 0x01 {
+		return false
+	}
+	i := 2
+	for i < len(em) && em[i] == 0xff {
+		i++
+	}
+	if i == len(em) || em[i] != 0x00 {
+		return false
+	}
+	return bytes.Equal(em[i+1:], data)
 }

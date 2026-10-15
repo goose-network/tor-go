@@ -30,9 +30,9 @@ import (
 // document's header. A client should re-fetch the consensus before
 // FreshUntil (the document is "fresh" until then, "valid" until ValidUntil).
 type ConsensusMeta struct {
-	ValidAfter  time.Time
-	FreshUntil  time.Time
-	ValidUntil  time.Time
+	ValidAfter time.Time
+	FreshUntil time.Time
+	ValidUntil time.Time
 }
 
 // ParseConsensusMeta extracts the validity timestamps from a consensus
@@ -281,6 +281,13 @@ func splitSpaces(s string) []string {
 //	s <flags...>
 //	m <microdesc-digest(base64-padded-sha256)>
 //	pr ...
+//
+// The "r" line digest column exists only in the ns flavor; a microconsensus
+// omits it, so its r line is one field shorter (see parseRLine). C reference:
+// src/feature/nodelist/fmt_routerstatus.c prints the digest only for
+// NS_V3_CONSENSUS, and src/feature/dirparse/ns_parse.c's
+// routerstatus_parse_entry_from_string compensates with offset=-1 for
+// FLAV_MICRODESC.
 func ParseConsensus(text []byte) (map[string]*Router, error) {
 	out := make(map[string]*Router)
 	sc := bufio.NewScanner(bytes.NewReader(text))
@@ -326,26 +333,63 @@ func ParseConsensus(text []byte) (map[string]*Router, error) {
 	return out, nil
 }
 
-// parseRLine parses an "r" line.
+// parseRLine parses an "r" line in either consensus flavor:
+//
+//	ns flavor:  r <nickname> <identity> <digest> <YYYY-MM-DD> <HH:MM:SS> <ip> <orport> <dirport>
+//	microdesc:  r <nickname> <identity> <YYYY-MM-DD> <HH:MM:SS> <ip> <orport> <dirport>
+//
+// The descriptor-digest column is printed only in the ns flavor
+// (fmt_routerstatus.c collapses it for NS_V3_CONSENSUS_MICRODESC), so a
+// microconsensus r line has 8 fields, an ns-flavor one 9. The C parser knows
+// the flavor from the document header and shifts its field indices by 1 for
+// FLAV_MICRODESC (ns_parse.c: offset = -1); here the two forms are told apart
+// by the published column itself: a base64 digest can never contain "-", so
+// a YYYY-MM-DD at fields[3] identifies the digestless microdesc form. The
+// descriptor digest is unused by this client (microdescriptors are matched
+// by their "m"-line sha256), only the identity digest is required.
 func parseRLine(line string) *Router {
-	// r <nickname> <identity> <digest> <pub> <YYYY-MM-DD> <HH:MM:SS> <ip> <orport> <dirport>
 	fields := strings.Fields(line)
-	if len(fields) < 9 || fields[0] != "r" {
+	if len(fields) < 8 || fields[0] != "r" {
+		return nil
+	}
+	// ipOff is the index of the IPv4 address; the published date follows the
+	// identity in the microdesc flavor but the descriptor digest in the ns
+	// flavor, shifting everything after it by one.
+	ipOff := 6
+	if isDateField(fields[3]) {
+		ipOff = 5
+	} else if len(fields) < 9 {
 		return nil
 	}
 	r := &Router{}
 	r.Nickname = fields[1]
-	id, err := base64.StdEncoding.DecodeString(fields[2])
+	id, err := decodeUnpadded(fields[2])
 	if err != nil || len(id) != 20 {
 		return nil
 	}
 	copy(r.IDDigest[:], id)
-	r.Address = fmt.Sprintf("%s:%s", fields[6], fields[7])
-	r.ORPort = parseUint16(fields[7])
-	if len(fields) >= 9 {
-		r.DirPort = parseUint16(fields[8])
-	}
+	r.Address = fmt.Sprintf("%s:%s", fields[ipOff], fields[ipOff+1])
+	r.ORPort = parseUint16(fields[ipOff+1])
+	r.DirPort = parseUint16(fields[ipOff+2])
 	return r
+}
+
+// isDateField reports whether s looks like the date half of an ISO published
+// timestamp ("YYYY-MM-DD"); "-" is not in the base64 alphabet, so a base64
+// digest never matches.
+func isDateField(s string) bool {
+	return len(s) == 10 && s[4] == '-' && s[7] == '-'
+}
+
+// decodeUnpadded base64-decodes s, tolerating the unpadded form the consensus
+// uses for the identity digest (digest_to_base64 in the C reference emits
+// stripped padding). C reference: src/lib/crypt_ops/crypto_format.c
+// (digest_to_base64 → base64_encode_nopad).
+func decodeUnpadded(s string) ([]byte, error) {
+	if pad := len(s) % 4; pad != 0 {
+		s += strings.Repeat("=", 4-pad)
+	}
+	return base64.StdEncoding.DecodeString(s)
 }
 
 // parseALine parses an "a" line (IPv6 OR address, "ipv6:port").

@@ -3,6 +3,7 @@ package directory
 import (
 	"crypto/sha256"
 	"encoding/base64"
+	"encoding/hex"
 	"testing"
 	"time"
 )
@@ -43,9 +44,52 @@ m H4sIAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAA
 		t.Fatal("guard missing Guard flag")
 	}
 	// The identity digest should be the base64-decoded 20 bytes.
-	if (guard.IDDigest == [20]byte{}) {
+	if guard.IDDigest == [20]byte{} {
 		t.Fatal("guard IDDigest is zero")
 	}
+}
+
+func TestParseConsensusMicrodescRLine(t *testing.T) {
+	// The real network serves the microdesc flavor of the consensus, whose
+	// "r" line omits the descriptor-digest column; e.g. from a live fetch:
+	//   r BaumiMiddleRelays AARRU4FvZE54rWG9Lt78faKFh6Q 2038-01-01 00:00:00 91.66.247.27 9006 0
+	// The unit test above covers the ns flavor; this one pins the 8-field form.
+	text := []byte("r mockguard ERERERERERERERERERERERERERE= 2026-01-01 00:00:00 1.2.3.4 9001 9030\n" +
+		"s Guard Stable Valid\n" +
+		// 32 bytes of 0x11, i.e. the sha256-matching digest of some microdesc.
+		"m ERERERERERERERERERERERERERERERERERERERERERE=\n")
+	routers, err := ParseConsensus(text)
+	if err != nil {
+		t.Fatalf("ParseConsensus: %v", err)
+	}
+	if len(routers) != 1 {
+		t.Fatalf("got %d routers, want 1", len(routers))
+	}
+	r := routers[hexIdentity("ERERERERERERERERERERERERERE=")]
+	if r == nil {
+		t.Fatal("router not keyed by identity digest")
+	}
+	if r.Address != "1.2.3.4:9001" {
+		t.Fatalf("address = %q, want 1.2.3.4:9001", r.Address)
+	}
+	if r.ORPort != 9001 || r.DirPort != 9030 {
+		t.Fatalf("ports = %d/%d, want 9001/9030", r.ORPort, r.DirPort)
+	}
+	if r.IDDigest == [20]byte{} {
+		t.Fatal("IDDigest is zero")
+	}
+	if r.MicrodescDigest == [32]byte{} {
+		t.Fatal("MicrodescDigest is zero")
+	}
+}
+
+// hexIdentity decodes a base64 identity into its hex key form.
+func hexIdentity(b64 string) string {
+	raw, err := base64.StdEncoding.DecodeString(b64)
+	if err != nil {
+		return ""
+	}
+	return hex.EncodeToString(raw)
 }
 
 func TestParseMicrodescriptors(t *testing.T) {
@@ -54,9 +98,10 @@ func TestParseMicrodescriptors(t *testing.T) {
 	// SHA-256 of the microdescriptor body, so we compute it here and set it
 	// on the router before parsing.
 	routers := make(map[string]*Router)
-	r := &Router{Nickname: "mockguard"}
+	var r Router
+	r.Nickname = "mockguard"
 	copy(r.IDDigest[:], []byte("12345678901234567890"))
-	routers[encodeID(r.IDDigest)] = r
+	routers[encodeID(r.IDDigest)] = &r
 
 	// Encode a 32-byte ntor key in base64.
 	ntor := make([]byte, 32)

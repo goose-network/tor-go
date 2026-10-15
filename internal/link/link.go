@@ -44,15 +44,14 @@ const MaxCellSize = torcell.TotalSize4
 // Link is an established TLS channel to a relay, past the link handshake.
 // It multiplexes cells for many circuits over a single TCP+TLS connection.
 type Link struct {
-	conn   net.Conn
-	codec  *torcell.Codec
-	proto  uint16 // negotiated link protocol version
+	conn  net.Conn
+	codec *torcell.Codec
+	proto uint16 // negotiated link protocol version
 
 	// Circuits registered on this link, keyed by CircID. Incoming cells are
 	// dispatched to the channel associated with the cell's CircID.
 	mu       sync.RWMutex
 	circuits map[uint32]chan *torcell.Cell
-	nextID   uint32
 
 	// closed when the read loop exits.
 	done chan struct{}
@@ -107,7 +106,7 @@ type RouterIdentity struct {
 // upstream proxy; see DialWithUpstream to reach relays through a SOCKS5
 // proxy (e.g. socks5://127.0.0.1:7890).
 func Dial(ctx context.Context, addr string, expectedIDDigest []byte) (*Link, error) {
-	return DialWithUpstream(ctx, "", addr, expectedIDDigest)
+	return DialWithUpstream(ctx, "", addr, expectedIDDigest, [32]byte{})
 }
 
 // DialWithUpstream is like Dial but establishes the TCP connection to addr
@@ -115,17 +114,26 @@ func Dial(ctx context.Context, addr string, expectedIDDigest []byte) (*Link, err
 // upstreamAddr is empty, the connection is dialed directly. The TLS link
 // handshake and identity check are then layered on top of the (possibly
 // tunneled) TCP connection.
-func DialWithUpstream(ctx context.Context, upstreamAddr, addr string, expectedIDDigest []byte) (*Link, error) {
+//
+// expectedIDDigest, when 20 bytes, is the consensus RSA identity digest the
+// CERTS cell's RSA ID cert must prove (the authoritative identity check).
+// expectedEd25519ID, when non-zero, is the relay's expected ed25519 master
+// identity; a verified mismatch (or "wanted ed, got none") is a hard link
+// failure, mirroring connection_or_client_learned_peer_id
+// (connection_or.c): "It only counts as an ed25519 mismatch if we wanted an
+// ed25519 identity and didn't get it."
+func DialWithUpstream(ctx context.Context, upstreamAddr, addr string, expectedIDDigest []byte, expectedEd25519ID [32]byte) (*Link, error) {
 	tcpConn, err := proxy.Dial(ctx, upstreamAddr, addr)
 	if err != nil {
 		return nil, fmt.Errorf("link: dial %s: %w", addr, err)
 	}
 
 	tlsCfg := &tls.Config{
-		// Tor relays present a self-signed cert whose subject CN is the
-		// relay's nickname and whose cert DER, when hashed with SHA-1, gives
-		// the identity digest. We do not verify against a CA; instead we
-		// verify the digest ourselves after the handshake (see verifyPeer).
+		// Tor relays present a self-signed link cert (often with a rotating
+		// fake hostname CN) whose DER does NOT hash to the RSA identity —
+		// the identity is proven by the CERTS cell's RSA ID cert, checked
+		// after the link handshake. We never verify against a CA; the digest
+		// check below is the authentication.
 		InsecureSkipVerify: true,
 		MinVersion:         tls.VersionTLS12,
 	}
@@ -135,17 +143,13 @@ func DialWithUpstream(ctx context.Context, upstreamAddr, addr string, expectedID
 		return nil, fmt.Errorf("link: tls handshake: %w", err)
 	}
 
-	// Verify the relay's identity digest if one was provided.
-	if len(expectedIDDigest) == 20 {
-		if err := verifyPeer(tlsConn, expectedIDDigest); err != nil {
-			tlsConn.Close()
-			return nil, err
-		}
-	}
-
 	l := &Link{
-		conn:     tlsConn,
-		codec:    torcell.NewCodec(tlsConn, 4),
+		conn: tlsConn,
+		// per tor-spec, cells sent before the link protocol is negotiated
+		// (the first VERSIONS exchange) carry 2-byte circuit IDs; the codec
+		// flips to 4 bytes inside handshake() once proto >= 4 is agreed
+		// (channeltls.c:1620).
+		codec:    torcell.NewCodec(tlsConn, 2),
 		circuits: make(map[uint32]chan *torcell.Cell),
 		done:     make(chan struct{}),
 	}
@@ -153,23 +157,49 @@ func DialWithUpstream(ctx context.Context, upstreamAddr, addr string, expectedID
 		tlsConn.Close()
 		return nil, err
 	}
-	// If CERTS verification established an RSA identity, check it against the
-	// expected digest (the consensus identity). This is the authoritative
-	// identity check; the earlier verifyPeer TLS-digest check is a fallback
-	// for relays that send a degenerate CERTS cell.
-	if l.peerID != nil && len(expectedIDDigest) == 20 {
+	// Check the learned identity digest if one was expected (the consensus
+	// "r" line identity). The CERTS cell's RSA ID cert is the authoritative
+	// proof — Tor never compares the TLS link cert DER to the identity
+	// (connection_or.c: connection_or_client_learned_peer_id) — so this runs
+	// after the handshake. The legacy TLS-cert-digest check (verifyPeer) is
+	// a fallback for links that presented a degenerate CERTS cell, which the
+	// in-process test harness relies on.
+	if len(expectedIDDigest) != 20 {
+		// No expected digest: nothing to verify (test harness links).
+		go l.readLoop()
+		return l, nil
+	}
+	if l.peerID != nil {
 		if !bytes.Equal(l.peerID.rsaIDDigest[:], expectedIDDigest) {
 			tlsConn.Close()
 			return nil, fmt.Errorf("link: CERTS identity digest mismatch (got %x, want %x)", l.peerID.rsaIDDigest, expectedIDDigest)
 		}
+		// When the directory lists an ed25519 identity for the relay, the
+		// CERTS-verified one must match it (connection_or.c:
+		// connection_or_client_learned_peer_id's ed25519_mismatch).
+		if !isZeroID(expectedEd25519ID) && l.peerID.hasEd25519 &&
+			l.peerID.ed25519ID != expectedEd25519ID {
+			tlsConn.Close()
+			return nil, fmt.Errorf("link: CERTS ed25519 identity mismatch (got %x, want %x)", l.peerID.ed25519ID, expectedEd25519ID)
+		}
+	} else if err := verifyPeer(tlsConn, expectedIDDigest); err != nil {
+		// Degenerate CERTS: the harness's minimal CERTS cell carries no
+		// certificates, and its TLS cert DER hashes to the identity.
+		tlsConn.Close()
+		return nil, err
 	}
 	go l.readLoop()
 	return l, nil
 }
 
 // verifyPeer checks that the relay's TLS certificate hashes to the expected
-// 20-byte SHA-1 identity digest. Tor derives the identity digest from the
-// SHA-1 of the DER-encoded certificate (for the legacy RSA link cert).
+// 20-byte SHA-1 identity digest. This is NOT a Tor identity mechanism — Tor
+// never compares the TLS link cert DER to the identity (connection_or.c:
+// connection_or_client_learned_peer_id); it is a test-harness-only fallback
+// for links that presented a degenerate CERTS cell: the harness generates
+// its TLS certs so that SHA-1(cert DER) == IDDigest, letting in-process tests
+// authenticate the mock relays. On the real network a link with a degenerate
+// CERTS cell fails this check and the connection is dropped.
 func verifyPeer(tlsConn *tls.Conn, expectedIDDigest []byte) error {
 	state := tlsConn.ConnectionState()
 	if len(state.PeerCertificates) == 0 {
@@ -185,7 +215,7 @@ func verifyPeer(tlsConn *tls.Conn, expectedIDDigest []byte) error {
 }
 
 func sha1Digest(b []byte) []byte {
-	// Tor's identity digest is the SHA-1 of the DER-encoded link cert.
+	// Test-harness convention only; see verifyPeer.
 	return sha1Of(b)
 }
 
@@ -502,35 +532,54 @@ func (l *Link) readLoop() {
 // Register allocates a new circuit ID on this link and returns it along with
 // a channel that receives inbound cells for that circuit. The caller must
 // call Unregister when the circuit is torn down.
+//
+// We are always the initiator (this Link is a client→relay channel), and on
+// the wide links we actually run (negotiated protocol >= MIN_LINK_PROTO_FOR_
+// WIDE_CIRC_IDS = 4, connection_or.h:111 — handshake() rejects anything
+// lower), channel_set_circid_type (channel.c:3425) passes consider_identity=0
+// and gives us CIRC_ID_TYPE_HIGHER: our circuit IDs come from the high half
+// of the space (bit 31) and the relay picks from the low half;
+// command_process_create_cell (command.c:313) destroys any CREATE whose ID
+// carries the wrong direction. (On a narrow link C instead compares identity
+// keys, and a keyless client lands in the LOW half; the bit-15 fallback
+// branch below is dead under MinLinkProtocol=4 and retained only for
+// completeness.) We also avoid 0: the responder drops circ_id 0 silently.
+// The draw-and-retry loop mirrors get_unique_circ_id_by_chan
+// (circuitbuild.c:133), including its MAX_CIRCID_ATTEMPTS bound.
 func (l *Link) Register() (uint32, <-chan *torcell.Cell, error) {
+	wide := l.proto >= MinLinkProtocol
+	highBit := uint32(1) << 15
+	if wide {
+		highBit = 1 << 31
+	}
 	l.mu.Lock()
 	defer l.mu.Unlock()
-	// Circuit IDs chosen by the initiator use the high bit clear; the
-	// responder uses the high bit set. We pick the next odd-ish ID.
-	id := l.nextID
-	if id == 0 {
-		// Start at a random odd number to avoid collisions after reconnect.
+	// Pick a random ID from our half of the space, skipping ones already in
+	// use (MAX_CIRCID_ATTEMPTS bounds the loop; the space is essentially
+	// unbounded for a client with a handful of circuits).
+	var id uint32
+	for attempts := 0; attempts < 64; attempts++ {
 		var b [4]byte
 		rand.Read(b[:])
-		id = binary.BigEndian.Uint32(b[:]) & 0x7FFFFFFF
+		id = binary.BigEndian.Uint32(b[:])
+		if wide {
+			// Restrict to the high half: 0x80000000..0xFFFFFFFF.
+			id |= highBit
+		} else {
+			// Restrict to the high half of the 16-bit space: 0x8000..0xFFFF.
+			id &= highBit - 1
+			id |= highBit
+		}
 		if id == 0 {
-			id = 1
+			continue
 		}
-		if id%2 == 0 {
-			id++
-		}
-	}
-	// Ensure uniqueness.
-	for {
 		if _, ok := l.circuits[id]; !ok {
-			break
+			ch := make(chan *torcell.Cell, 64)
+			l.circuits[id] = ch
+			return id, ch, nil
 		}
-		id += 2
 	}
-	l.nextID = id + 2
-	ch := make(chan *torcell.Cell, 64)
-	l.circuits[id] = ch
-	return id, ch, nil
+	return 0, nil, errors.New("link: no unused circuit IDs available")
 }
 
 // Unregister removes a circuit's dispatch entry.
@@ -543,6 +592,17 @@ func (l *Link) Unregister(id uint32) {
 // Send writes a cell on the link.
 func (l *Link) Send(cell *torcell.Cell) error {
 	return l.codec.WriteCell(cell)
+}
+
+// SendPadding sends an unsolicited PADDING cell (command 0, zero payload).
+// Tor relays accept and drop unsolicited padding on established channels —
+// command_process_cell's default case just logs and drops (command.c:212) —
+// which makes it the channel keep-alive: the C client keeps channels from
+// being reaped by intermediaries with negotiated channel padding
+// (channelpadding.c); here it defeats idle-timeout reaping by upstream
+// SOCKS5 proxies such as Clash/mihomo that silently drop idle tunnels.
+func (l *Link) SendPadding() error {
+	return l.codec.WriteCell(&torcell.Cell{Command: torcell.CellPadding})
 }
 
 // Protocol returns the negotiated link protocol version.
@@ -578,6 +638,29 @@ func (l *Link) Wait() error {
 	l.mu.RLock()
 	defer l.mu.RUnlock()
 	return l.err
+}
+
+// IsAlive reports whether the link's read loop is still running and the
+// channel has not failed. A link that has died (peer closed, upstream proxy
+// dropped the tunnel, TLS error) returns false; callers holding a stale
+// Link should dial a fresh one.
+func (l *Link) IsAlive() bool {
+	select {
+	case <-l.done:
+		return false
+	default:
+		return true
+	}
+}
+
+// isZeroID reports whether id is the zero value ("no expected identity").
+func isZeroID(id [32]byte) bool {
+	for _, b := range id {
+		if b != 0 {
+			return false
+		}
+	}
+	return true
 }
 
 // RemoteAddr returns the address of the peer.

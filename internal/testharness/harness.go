@@ -57,11 +57,11 @@ type RelayConfig struct {
 
 // MockRelay is a running mock relay server.
 type MockRelay struct {
-	cfg      RelayConfig
-	ln       net.Listener
-	tlsCfg   *tls.Config
-	certDER  []byte
-	addr     string
+	cfg     RelayConfig
+	ln      net.Listener
+	tlsCfg  *tls.Config
+	certDER []byte
+	addr    string
 
 	mu       sync.Mutex
 	circuits map[uint32]*relayCircuit
@@ -91,8 +91,8 @@ type relayCircuit struct {
 // relayStream is an exit stream: a TCP connection to the target plus the
 // circuit + stream id it belongs to.
 type relayStream struct {
-	conn    net.Conn
-	circ    *relayCircuit
+	conn     net.Conn
+	circ     *relayCircuit
 	streamID uint16
 }
 
@@ -230,7 +230,11 @@ func (r *MockRelay) handleConn(conn net.Conn) {
 		log.Printf("testharness %s: tls handshake: %v", r.cfg.Nickname, err)
 		return
 	}
-	codec := torcell.NewCodec(tlsConn, 4)
+	// per tor-spec, cells sent before the link protocol is negotiated carry
+	// 2-byte circuit IDs. The client's first VERSIONS arrives narrow; the
+	// codec flips to the negotiated width in linkHandshake below (mirroring
+	// channeltls.c:1620).
+	codec := torcell.NewCodec(tlsConn, 2)
 	if err := r.linkHandshake(codec); err != nil {
 		log.Printf("testharness %s: link handshake: %v", r.cfg.Nickname, err)
 		return
@@ -261,13 +265,17 @@ func (r *MockRelay) linkHandshake(codec *torcell.Codec) error {
 	if best == 0 {
 		return errors.New("no common link protocol version")
 	}
-	codec.SetCircIDWidth(4)
 
-	// 2. Send our VERSIONS.
+	// 2. Send our VERSIONS. The reply must go out with the same 2-byte
+	// circuit-ID width the client is still using (it flips only after
+	// reading our VERSIONS), so the width flip happens after the write —
+	// mirroring C, which sets wide_circ_ids after sending the VERSIONS cell
+	// (channeltls.c:1620 sets it after connection_or_send_versions).
 	versionsPayload := []byte{0x00, byte(best)}
 	if err := codec.WriteVarCell(&torcell.VarCell{Command: torcell.CellVersions, Payload: versionsPayload}); err != nil {
 		return err
 	}
+	codec.SetCircIDWidth(4)
 
 	// 3. Send CERTS (empty-ish: we send a minimal valid CERTS cell the client
 	// will consume and ignore) and AUTH_CHALLENGE. The client's
@@ -385,12 +393,13 @@ func (r *MockRelay) handleCreate2(codec *torcell.Codec, cell *torcell.Cell) {
 	r.circuits[cell.CircID] = rc
 	r.mu.Unlock()
 
-	// CREATED2 payload: [hsType:2][hsLen:2][hsData]. hsData is the 64-byte
-	// ntor reply. (The client's finishHandshake expects hsLen == 64.)
-	created2 := make([]byte, 4+len(reply))
-	binary.BigEndian.PutUint16(created2[0:2], 2)
-	binary.BigEndian.PutUint16(created2[2:4], uint16(len(reply)))
-	copy(created2[4:], reply)
+	// CREATED2 payload: [handshake_len:2][handshake_data], mirroring
+	// created_cell_format (onion.c: created_cell_parse reads handshake_len
+	// from the first 2 bytes and the reply follows — there is no
+	// handshake-type echo on replies). hsData is the 64-byte ntor reply.
+	created2 := make([]byte, 2+len(reply))
+	binary.BigEndian.PutUint16(created2[0:2], uint16(len(reply)))
+	copy(created2[2:], reply)
 	out := &torcell.Cell{CircID: cell.CircID, Command: torcell.CellCreated2}
 	copy(out.Payload[:], created2)
 	codec.WriteCell(out)
@@ -474,6 +483,13 @@ func (r *MockRelay) dispatchForward(codec *torcell.Codec, rc *relayCircuit, buf 
 
 // handleExtend2 processes an EXTEND2: parse link specifiers, find the next
 // relay, send CREATE2, wrap CREATED2 as EXTENDED2 encrypted back to client.
+//
+// The link-specifier type codes are validated like trunnel's
+// link_specifier_parse_into (src/trunnel/ed25519_cert.c): 0=LS_IPV4 (len 6),
+// 1=LS_IPV6 (len 18), 2=LS_LEGACY_ID (len 20), 3=LS_ED25519_ID (len 32). A
+// specifier whose declared length doesn't fit its type is a protocol
+// violation and destroys the circuit with BadProtocol, the same way
+// extend_cell_parse fails on the C side.
 func (r *MockRelay) handleExtend2(codec *torcell.Codec, rc *relayCircuit, body []byte) {
 	if len(body) < 1 {
 		return
@@ -483,37 +499,59 @@ func (r *MockRelay) handleExtend2(codec *torcell.Codec, rc *relayCircuit, body [
 	var nextID [20]byte
 	for i := 0; i < nSpecs; i++ {
 		if off+2 > len(body) {
+			r.sendDestroy(codec, rc.circID, torcell.DestroyReasonBadProtocol)
 			return
 		}
 		lsType := body[off]
 		lsLen := int(body[off+1])
 		off += 2
 		if off+lsLen > len(body) {
+			r.sendDestroy(codec, rc.circID, torcell.DestroyReasonBadProtocol)
 			return
 		}
 		lsData := body[off : off+lsLen]
 		off += lsLen
 		switch lsType {
-		case 1: // IPv4 + port (we route by identity digest, so ignore)
-		case 2: // legacy RSA identity digest
-			if lsLen == 20 {
-				copy(nextID[:], lsData)
+		case 0: // LS_IPV4: 4-byte address + 2-byte port
+			if lsLen != 6 {
+				r.sendDestroy(codec, rc.circID, torcell.DestroyReasonBadProtocol)
+				return
 			}
-		case 3: // ed25519 identity
-			// We don't use ed25519 for routing in the mock; ignore.
+			// We route by identity digest, so the address is ignored.
+		case 1: // LS_IPV6: 16-byte address + 2-byte port
+			if lsLen != 18 {
+				r.sendDestroy(codec, rc.circID, torcell.DestroyReasonBadProtocol)
+				return
+			}
+		case 2: // LS_LEGACY_ID: RSA identity digest
+			if lsLen != 20 {
+				r.sendDestroy(codec, rc.circID, torcell.DestroyReasonBadProtocol)
+				return
+			}
+			copy(nextID[:], lsData)
+		case 3: // LS_ED25519_ID: ed25519 identity (not used for mock routing)
+			if lsLen != 32 {
+				r.sendDestroy(codec, rc.circID, torcell.DestroyReasonBadProtocol)
+				return
+			}
+		default:
+			// Unknown specifier types are ignored, per trunnel's default case.
 		}
 	}
 	if off+4 > len(body) {
+		r.sendDestroy(codec, rc.circID, torcell.DestroyReasonBadProtocol)
 		return
 	}
 	hsType := binary.BigEndian.Uint16(body[off : off+2])
 	hsLen := binary.BigEndian.Uint16(body[off+2 : off+4])
 	off += 4
 	if off+int(hsLen) > len(body) {
+		r.sendDestroy(codec, rc.circID, torcell.DestroyReasonBadProtocol)
 		return
 	}
 	hsData := body[off : off+int(hsLen)]
 	if hsType != 2 {
+		r.sendDestroy(codec, rc.circID, torcell.DestroyReasonBadProtocol)
 		return
 	}
 	// Find the next relay by identity digest.
@@ -583,17 +621,18 @@ func (r *MockRelay) extendTo(hsData []byte, prev *relayCircuit, prevRelay *MockR
 	r.circuits[circID] = rc
 	r.mu.Unlock()
 
-	created2 := make([]byte, 4+len(reply))
-	binary.BigEndian.PutUint16(created2[0:2], 2)
-	binary.BigEndian.PutUint16(created2[2:4], uint16(len(reply)))
-	copy(created2[4:], reply)
+	// CREATED2 reply framed as [handshake_len:2][handshake_data] (same rule
+	// as the guard's handleCreate2; the type field is not echoed).
+	created2 := make([]byte, 2+len(reply))
+	binary.BigEndian.PutUint16(created2[0:2], uint16(len(reply)))
+	copy(created2[2:], reply)
 	return &extendResult{circuit: rc, created2Payload: created2}, nil
 }
 
 // extendResult carries the new circuit and the CREATED2 payload to wrap.
 type extendResult struct {
-	circuit           *relayCircuit
-	created2Payload   []byte
+	circuit         *relayCircuit
+	created2Payload []byte
 }
 
 // handleBegin processes a RELAY_BEGIN: dial the target, reply CONNECTED, and
@@ -775,11 +814,11 @@ type Harness struct {
 // from a non-test package); instead the test that builds the client converts
 // these to directory.Router values.
 type dirEntry struct {
-	Nickname   string
-	IDDigest   [20]byte
-	OnionKey   [32]byte
-	Address    string
-	Flags      []string
+	Nickname string
+	IDDigest [20]byte
+	OnionKey [32]byte
+	Address  string
+	Flags    []string
 }
 
 // NewHarness starts a chain of n mock relays (guard, middle, ..., exit) on

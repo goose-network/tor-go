@@ -89,13 +89,13 @@ func TestE2ERealTorNetwork(t *testing.T) {
 	socksLn.Close()
 
 	cfg := &torclient.Config{
-		SocksAddr:            socksAddr,
-		PathLen:              3,
-		Directory:            dir,
-		Guard:                guard,
-		UpstreamProxy:        upstream,
-		LinkDialTimeout:      45 * time.Second,
-		CircuitBuildTimeout:  90 * time.Second,
+		SocksAddr:           socksAddr,
+		PathLen:             3,
+		Directory:           dir,
+		Guard:               guard,
+		UpstreamProxy:       upstream,
+		LinkDialTimeout:     45 * time.Second,
+		CircuitBuildTimeout: 90 * time.Second,
 	}
 	ctx, cancel := context.WithTimeout(context.Background(), 8*time.Minute)
 	defer cancel()

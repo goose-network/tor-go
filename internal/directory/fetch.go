@@ -14,6 +14,7 @@ import (
 	"bufio"
 	"context"
 	"crypto/tls"
+	"encoding/base64"
 	"encoding/hex"
 	"errors"
 	"fmt"
@@ -27,17 +28,20 @@ import (
 )
 
 // DirectoryAuthority is a source for directory documents. The URLs point at
-// an HTTPS endpoint serving the microconsensus and microdescriptors. The Tor
-// directory authorities expose these under /tor/... on their dirports; the
-// consensus-health mirror also serves the microconsensus.
+// an HTTP(S) endpoint serving the microconsensus and microdescriptors. The Tor
+// directory authorities serve these on their dirports (plain HTTP, port 80 or
+// a dedicated dirport — see src/app/config/auth_dirs.inc in the C reference)
+// under /tor/...; the consensus-health mirror also serves the microconsensus
+// over HTTPS.
 type DirectoryAuthority struct {
 	Name string
 	// ConsensusURL serves the current microconsensus.
 	ConsensusURL string
-	// MicrodescURL returns the URL for a microdescriptor given its hex
-	// SHA-256 digest (the "m" line digest, base64-decoded then hex-encoded).
+	// MicrodescURL returns the URL for a microdescriptor given its
+	// unpadded-base64 SHA-256 digest (exactly the "m" line token, as the C
+	// client passes it: dirclient.c builds /tor/micro/d/<base64-digests>).
 	// If nil, this authority does not serve microdescriptors.
-	MicrodescURL func(hexDigest string) string
+	MicrodescURL func(base64Digest string) string
 	// CertURL returns the URL for an authority certificate given its
 	// SHA-1 fingerprint (the identity-key digest, lowercase hex). If nil,
 	// this authority does not serve authority certs. The standard endpoint
@@ -46,27 +50,35 @@ type DirectoryAuthority struct {
 }
 
 // DefaultAuthorities is a list of directory sources to try, in order. The
-// consensus-health mirror is first because it is a stable HTTPS endpoint; the
-// directory authorities follow and also serve microdescriptors and authority
-// certificates.
+// authorities' addresses and dirports mirror the C client's auth_dirs.inc:
+// moria1 128.31.0.39:9231, tor26 217.196.147.77:80, dizum 45.66.35.11:80.
+// All three serve the consensus, microdescriptors and authority certs over
+// plain HTTP on their dirports. The consensus-health mirror (HTTPS) is kept
+// last as a stable fallback.
 var DefaultAuthorities = []DirectoryAuthority{
+	{
+		Name:         "moria1",
+		ConsensusURL: "http://128.31.0.39:9231/tor/status-vote/current/consensus-microdesc",
+		MicrodescURL: func(b64 string) string { return "http://128.31.0.39:9231/tor/micro/d/" + b64 },
+		CertURL:      func(fp string) string { return "http://128.31.0.39:9231/tor/keys/fp/" + fp },
+	},
+	{
+		Name:         "tor26",
+		ConsensusURL: "http://217.196.147.77:80/tor/status-vote/current/consensus-microdesc",
+		MicrodescURL: func(b64 string) string { return "http://217.196.147.77:80/tor/micro/d/" + b64 },
+		CertURL:      func(fp string) string { return "http://217.196.147.77:80/tor/keys/fp/" + fp },
+	},
+	{
+		Name:         "dizum",
+		ConsensusURL: "http://45.66.35.11:80/tor/status-vote/current/consensus-microdesc",
+		MicrodescURL: func(b64 string) string { return "http://45.66.35.11:80/tor/micro/d/" + b64 },
+		CertURL:      func(fp string) string { return "http://45.66.35.11:80/tor/keys/fp/" + fp },
+	},
 	{
 		Name:         "consensus-health",
 		ConsensusURL: "https://consensus-health.torproject.org/consensus-microdesc/consensus-microdesc-latest",
 		MicrodescURL: nil,
 		CertURL:      nil,
-	},
-	{
-		Name:         "moria1",
-		ConsensusURL: "https://128.31.0.34:9131/tor/status-vote/current/consensus-microdesc",
-		MicrodescURL: func(h string) string { return "https://128.31.0.34:9131/tor/micro/d/" + h },
-		CertURL:      func(fp string) string { return "https://128.31.0.34:9131/tor/keys/fp/" + fp },
-	},
-	{
-		Name:         "maatuska",
-		ConsensusURL: "https://171.25.193.78:443/tor/status-vote/current/consensus-microdesc",
-		MicrodescURL: func(h string) string { return "https://171.25.193.78:443/tor/micro/d/" + h },
-		CertURL:      func(fp string) string { return "https://171.25.193.78:443/tor/keys/fp/" + fp },
 	},
 }
 
@@ -225,12 +237,15 @@ func FetchWithMeta(ctx context.Context, opts FetchOptions) (map[string]*Router, 
 	}
 
 	type job struct {
-		hex string
+		b64 string
 		r   *Router
 	}
 	var jobs []job
 	for _, r := range routers {
-		jobs = append(jobs, job{fmt.Sprintf("%x", r.MicrodescDigest[:]), r})
+		// The "m" line digest is unpadded base64 (SHA-256); the dirport
+		// endpoint takes exactly that token (dircache.c: DSR_DIGEST256 |
+		// DSR_BASE64).
+		jobs = append(jobs, job{base64.RawStdEncoding.EncodeToString(r.MicrodescDigest[:]), r})
 		if opts.MaxMicrodescs > 0 && len(jobs) >= opts.MaxMicrodescs {
 			break
 		}
@@ -239,7 +254,7 @@ func FetchWithMeta(ctx context.Context, opts FetchOptions) (map[string]*Router, 
 	var mdBuf strings.Builder
 	fetched := 0
 	for _, j := range jobs {
-		body, err := getWith(ctx, client, mdSource.MicrodescURL(j.hex))
+		body, err := getWith(ctx, client, mdSource.MicrodescURL(j.b64))
 		if err != nil {
 			continue
 		}

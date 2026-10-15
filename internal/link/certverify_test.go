@@ -1,10 +1,10 @@
 package link
 
 import (
-	"crypto"
 	"crypto/ed25519"
 	"crypto/rand"
 	"crypto/rsa"
+	"crypto/sha1"
 	"crypto/sha256"
 	"crypto/x509"
 	"crypto/x509/pkix"
@@ -55,7 +55,7 @@ func TestVerifyCertsEd25519(t *testing.T) {
 		t.Fatal(err)
 	}
 	tlsDigest := sha256.Sum256(tlsDER)
-	edSignLink := makeEd25519Cert(5, now.Add(24*time.Hour), 0x02, asKey(tlsDigest[:]), signPriv, asKey(signPub), true)
+	edSignLink := makeEd25519Cert(5, now.Add(24*time.Hour), 0x03, asKey(tlsDigest[:]), signPriv, asKey(signPub), true)
 
 	// RSA→ed25519 crosscert: RSA ID key signs SHA256(prefix + ed_key + expiration).
 	crosscert := makeCrosscert(masterPub, now.Add(24*time.Hour), rsaIDKey)
@@ -82,8 +82,10 @@ func TestVerifyCertsEd25519(t *testing.T) {
 	if id.ed25519ID != asKey(masterPub) {
 		t.Fatalf("ed25519 identity = %x, want %x", id.ed25519ID, masterPub)
 	}
-	// RSA identity digest should be SHA-1 of the RSA ID cert's SPKI.
-	wantRSA, _ := rsaIDDigest(pc.idCert)
+	// RSA identity digest is SHA-1 of the RSA public key in PKCS#1 (i2d_
+	// RSAPublicKey) DER — computed here independently of rsaIDDigest so a
+	// regression to the PKIX/SPKI form (the pre-fix bug) fails the test.
+	wantRSA := sha1.Sum(x509.MarshalPKCS1PublicKey(&rsaIDKey.PublicKey))
 	if id.rsaIDDigest != wantRSA {
 		t.Fatalf("rsa digest = %x, want %x", id.rsaIDDigest, wantRSA)
 	}
@@ -167,7 +169,8 @@ func TestVerifyCertsRSAOnly(t *testing.T) {
 	if id.hasEd25519 {
 		t.Fatal("did not expect ed25519 identity in RSA-only path")
 	}
-	wantRSA, _ := rsaIDDigest(pc.idCert)
+	// Independent PKCS#1-form digest expectation (see TestVerifyCertsEd25519).
+	wantRSA := sha1.Sum(x509.MarshalPKCS1PublicKey(&rsaIDKey.PublicKey))
 	if id.rsaIDDigest != wantRSA {
 		t.Fatalf("rsa digest = %x, want %x", id.rsaIDDigest, wantRSA)
 	}
@@ -190,12 +193,12 @@ func TestParseCertsCellDegenerate(t *testing.T) {
 
 func selfSignedRSACert(key *rsa.PrivateKey, cn string) ([]byte, *x509.Certificate, error) {
 	tmpl := &x509.Certificate{
-		SerialNumber: big.NewInt(1),
-		Subject:      pkix.Name{CommonName: cn},
-		NotBefore:    time.Now().Add(-time.Hour),
-		NotAfter:    time.Now().Add(24 * time.Hour),
-		IsCA:         true,
-		KeyUsage:     x509.KeyUsageCertSign | x509.KeyUsageDigitalSignature,
+		SerialNumber:          big.NewInt(1),
+		Subject:               pkix.Name{CommonName: cn},
+		NotBefore:             time.Now().Add(-time.Hour),
+		NotAfter:              time.Now().Add(24 * time.Hour),
+		IsCA:                  true,
+		KeyUsage:              x509.KeyUsageCertSign | x509.KeyUsageDigitalSignature,
 		BasicConstraintsValid: true,
 	}
 	der, err := x509.CreateCertificate(rand.Reader, tmpl, tmpl, &key.PublicKey, key)
@@ -211,20 +214,20 @@ func selfSignedRSACert(key *rsa.PrivateKey, cn string) ([]byte, *x509.Certificat
 
 func signedRSACert(subjectKey *rsa.PrivateKey, issuerKey *rsa.PrivateKey, cn string) ([]byte, error) {
 	subjTmpl := &x509.Certificate{
-		SerialNumber: big.NewInt(2),
-		Subject:      pkix.Name{CommonName: cn},
-		NotBefore:    time.Now().Add(-time.Hour),
-		NotAfter:     time.Now().Add(24 * time.Hour),
-		KeyUsage:     x509.KeyUsageDigitalSignature,
+		SerialNumber:          big.NewInt(2),
+		Subject:               pkix.Name{CommonName: cn},
+		NotBefore:             time.Now().Add(-time.Hour),
+		NotAfter:              time.Now().Add(24 * time.Hour),
+		KeyUsage:              x509.KeyUsageDigitalSignature,
 		BasicConstraintsValid: true,
 	}
 	issuerTmpl := &x509.Certificate{
-		SerialNumber: big.NewInt(1),
-		Subject:      pkix.Name{CommonName: "rsa-id"},
-		NotBefore:    time.Now().Add(-time.Hour),
-		NotAfter:     time.Now().Add(24 * time.Hour),
-		IsCA:         true,
-		KeyUsage:     x509.KeyUsageCertSign | x509.KeyUsageDigitalSignature,
+		SerialNumber:          big.NewInt(1),
+		Subject:               pkix.Name{CommonName: "rsa-id"},
+		NotBefore:             time.Now().Add(-time.Hour),
+		NotAfter:              time.Now().Add(24 * time.Hour),
+		IsCA:                  true,
+		KeyUsage:              x509.KeyUsageCertSign | x509.KeyUsageDigitalSignature,
 		BasicConstraintsValid: true,
 	}
 	issuerDER, err := x509.CreateCertificate(rand.Reader, issuerTmpl, issuerTmpl, &issuerKey.PublicKey, issuerKey)
@@ -247,7 +250,7 @@ func signedRSACert(subjectKey *rsa.PrivateKey, issuerKey *rsa.PrivateKey, cn str
 //   - signingKey: the 32-byte signing key to embed (if includeSignKey)
 func makeEd25519Cert(certType uint8, validUntil time.Time, keyType uint8, certified [32]byte, signer ed25519.PrivateKey, signingKey [32]byte, includeSignKey bool) []byte {
 	var buf []byte
-	buf = append(buf, 0) // version
+	buf = append(buf, 1) // version: trunnel constrains it to IN [1]
 	buf = append(buf, certType)
 	expField := uint32(validUntil.Unix() / 3600)
 	var exp [4]byte
@@ -257,10 +260,13 @@ func makeEd25519Cert(certType uint8, validUntil time.Time, keyType uint8, certif
 	buf = append(buf, certified[:]...)
 	// Extensions.
 	if includeSignKey {
-		// One extension: ext_length=34 (type+flags+32), ext_type=4, ext_flags=0, key.
-		var extLen [2]byte
-		binary.BigEndian.PutUint16(extLen[:], 34)
+		// One extension of type CERTEXT_SIGNED_WITH_KEY. ext_length counts
+		// only the union body (the 32-byte signing key), per the trunnel
+		// write-back in ed25519_cert.c; the u8 ext_type and u8 ext_flags sit
+		// between the length and the body.
 		buf = append(buf, 0x01) // n_extensions
+		var extLen [2]byte
+		binary.BigEndian.PutUint16(extLen[:], 32)
 		buf = append(buf, extLen[:]...)
 		buf = append(buf, byte(certextSignedWithKey))
 		buf = append(buf, 0) // flags
@@ -280,7 +286,11 @@ func asKey(b []byte) [32]byte {
 	return k
 }
 
-// makeCrosscert builds an RSA→ed25519 crosscert: ed_key + expiration + RSA sig.
+// makeCrosscert builds an RSA→ed25519 crosscert: ed_key + expiration + RSA
+// sig, mirroring tor_make_rsa_ed25519_crosscert (torcert.c:331). The RSA
+// signature is a raw PKCS#1 v1.5 type-1 block over the bare SHA-256 digest
+// bytes (no DigestInfo wrap), matching crypto_pk_private_sign over NSS
+// (CKM_RSA_PKCS signs exactly the buffer it is given).
 func makeCrosscert(edKey ed25519.PublicKey, validUntil time.Time, rsaKey *rsa.PrivateKey) []byte {
 	signed := make([]byte, 0, 36)
 	signed = append(signed, edKey...)
@@ -291,9 +301,20 @@ func makeCrosscert(edKey ed25519.PublicKey, validUntil time.Time, rsaKey *rsa.Pr
 	h.Write([]byte(rsaEdCrosscertPrefix))
 	h.Write(signed)
 	digest := h.Sum(nil)
-	sig, err := rsa.SignPKCS1v15(rand.Reader, rsaKey, crypto.SHA256, digest)
-	if err != nil {
-		panic(err)
+	// Raw PKCS#1 v1.5 type-1 block: 00 01 FF..FF 00 <digest>.
+	k := rsaKey.N.BitLen() / 8
+	block := make([]byte, 0, k)
+	block = append(block, 0x00, 0x01)
+	for i := 0; i < k-3-len(digest); i++ {
+		block = append(block, 0xff)
+	}
+	block = append(block, 0x00)
+	block = append(block, digest...)
+	s := new(big.Int).Exp(new(big.Int).SetBytes(block), new(big.Int).Set(rsaKey.D), rsaKey.N)
+	sig := s.Bytes()
+	if len(sig) < k {
+		pad := make([]byte, k-len(sig))
+		sig = append(pad, sig...)
 	}
 	out := make([]byte, 0, len(signed)+1+len(sig))
 	out = append(out, signed...)
@@ -318,6 +339,9 @@ func packCertsCell(certs map[uint8][]byte) []byte {
 		}
 	}
 	var out []byte
+	// Leading u8 n_certs, per the certs_cell trunnel struct
+	// (src/trunnel/link_handshake.trunnel).
+	out = append(out, byte(len(types)))
 	for _, ty := range types {
 		body := certs[ty]
 		out = append(out, ty)
@@ -337,7 +361,10 @@ func cloneCertsPayload(p []byte) []byte {
 // applies fn to its body, returning a new payload.
 func mutateCertBody(payload []byte, certType uint8, fn func([]byte) []byte) []byte {
 	var out []byte
-	rest := payload
+	// Leading u8 n_certs is unchanged by any single-body mutation, so copy it
+	// through and walk the entries after it.
+	out = append(out, payload[0])
+	rest := payload[1:]
 	for len(rest) >= 3 {
 		ty := rest[0]
 		clen := int(binary.BigEndian.Uint16(rest[1:3]))
