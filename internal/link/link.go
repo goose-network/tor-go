@@ -123,7 +123,17 @@ func Dial(ctx context.Context, addr string, expectedIDDigest []byte) (*Link, err
 // (connection_or.c): "It only counts as an ed25519 mismatch if we wanted an
 // ed25519 identity and didn't get it."
 func DialWithUpstream(ctx context.Context, upstreamAddr, addr string, expectedIDDigest []byte, expectedEd25519ID [32]byte) (*Link, error) {
-	tcpConn, err := proxy.Dial(ctx, upstreamAddr, addr)
+	return DialWithDialer(ctx, nil, upstreamAddr, addr, expectedIDDigest, expectedEd25519ID)
+}
+
+// DialWithDialer is DialWithUpstream with the raw TCP hop dialed through d
+// (internal/proxy.Dialer): the connection to the relay — or to the upstream
+// SOCKS5 proxy, when one is configured — is established with d, then TLS and
+// the link handshake are layered on top. A nil d is the system dialer, so
+// embedders can route every relay connection through their own network
+// stack while keeping the optional SOCKS5 upstream hop.
+func DialWithDialer(ctx context.Context, d proxy.Dialer, upstreamAddr, addr string, expectedIDDigest []byte, expectedEd25519ID [32]byte) (*Link, error) {
+	tcpConn, err := proxy.DialWithDialer(ctx, d, upstreamAddr, addr)
 	if err != nil {
 		return nil, fmt.Errorf("link: dial %s: %w", addr, err)
 	}

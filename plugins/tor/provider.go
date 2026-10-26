@@ -2,11 +2,12 @@
 // engine (github.com/goose-network/goose). It embeds tor-go — a from-scratch
 // Go Tor client — as a library and exposes it to goose the same way the
 // Psiphon provider embeds tunnel-core: the provider bootstraps a real Tor
-// client (directory fetch, guard link, SOCKS5 listener) in the background,
-// and once the client is serving it emits ONE goose outbound of protocol
-// "socks5" pointing at tor-go's loopback SOCKS5 listener. The engine merges
-// that outbound into the provider's managed pool, so any goose inbound
-// routed through the pool forwards traffic over real Tor circuits.
+// client (directory fetch, guard link, circuit pool) in the background, and
+// once the client is connected it emits ONE goose outbound of protocol
+// "tor". Dials through that outbound open a Tor circuit IN PROCESS — the
+// outbound calls the client's DialStream directly — so there is no SOCKS/HTTP
+// hop between goose and the Tor client, and the client's own connections
+// (guard link, directory fetches) dial through the engine's layer-3/4 stack.
 //
 // This package lives inside the tor-go module (not a separate repo) because
 // it embeds tor-go's internal packages (internal/torclient, internal/directory),
@@ -21,7 +22,7 @@
 // single byte — easily a minute on first run. The provider therefore starts
 // tor-go in a background goroutine from the factory (mirroring the Psiphon
 // provider's startTunnel): Outbounds returns an empty set until the client
-// is listening, then signals Watch so the engine repolls promptly and the
+// is connected, then signals Watch so the engine repolls promptly and the
 // pool fills in without waiting for the 2-minute fallback poll. A bootstrap
 // failure (upstream down, authorities unreachable) is retried with backoff
 // in the same goroutine rather than failing the factory, so a temporarily
@@ -35,17 +36,16 @@
 //	{
 //	  "upstream_proxy":           "127.0.0.1:7890",  // SOCKS5 to reach relays/authorities
 //	  "path_len":                 3,                 // circuit hops (default 3)
-//	  "socks_listen":             "127.0.0.1:0",     // tor-go's own listener (default ephemeral)
 //	  "outbound_id":              "tor",             // goose outbound id (default "tor")
 //	  "fetch_timeout_seconds":    300,               // directory bootstrap timeout
 //	  "max_microdescs":          400,               // cap descriptors (0 = all)
 //	  "verify_signatures":        true,               // consensus signature quorum (default true; the
 //	                                                   // dirports serve plain HTTP — without this a MITM
 //	                                                   // could substitute the consensus)
-//	  "use_fallbacks":            false,             // CREATE_FAST fallback bootstrap
+//	  "use_fallbacks":            false,              // CREATE_FAST fallback bootstrap
 //	  "link_dial_timeout_seconds":  45,               // guard TLS link timeout
 //	  "circuit_build_timeout_seconds": 90,           // per-circuit build timeout
-//	  "allow_private_addresses":  false              // allow private SOCKS targets
+//	  "allow_private_addresses":  false              // allow private stream targets
 //	}
 package tor
 
@@ -54,7 +54,9 @@ import (
 	"encoding/json"
 	"errors"
 	"fmt"
+	"io"
 	"log"
+	"maps"
 	"net"
 	"sync"
 	"time"
@@ -62,11 +64,19 @@ import (
 	pub "github.com/goose-network/goose-plugin-api"
 
 	"github.com/goose-network/tor-go/internal/directory"
+	"github.com/goose-network/tor-go/internal/proxy"
 	"github.com/goose-network/tor-go/internal/torclient"
 )
 
 func init() {
-	pub.RegisterProvider("tor", New)
+	pub.RegisterProvider("tor", NewProvider)
+}
+
+// streamDialer is the tor-go client surface dialStream needs;
+// *torclient.Client implements it. An interface keeps the dial path testable
+// without a full Tor bootstrap.
+type streamDialer interface {
+	DialStream(ctx context.Context, target string) (io.ReadWriteCloser, error)
 }
 
 // Provider is a goose outbound provider backed by an embedded tor-go client.
@@ -74,16 +84,18 @@ func init() {
 type Provider struct {
 	cfg providerConfig
 
-	// client state, guarded by mu
+	// client is the running tor-go client, guarded by mu. It is non-nil from
+	// the moment a bootstrap attempt creates it until that attempt's Run
+	// exits; dials while it is nil or not connected fail fast.
 	mu       sync.Mutex
-	listenOn string // the address tor-go's SOCKS5 listener accepted
-	ready    bool   // listener is up and routable
-	startErr error  // last terminal startup error, surfaced via Outbounds
+	client   streamDialer
+	ready    bool  // client is connected to its guard link
+	startErr error // last terminal startup error, surfaced via Outbounds
 
 	// watch signals the engine that the outbound set changed (ready flip).
 	watchCh chan struct{}
 
-	// stop cancels the bootstrap/serve goroutine; stopWg waits for it.
+	// stop cancels the bootstrap/run goroutine; stopWg waits for it.
 	stop    context.CancelFunc
 	stopped chan struct{} // closed when the goroutine exits
 }
@@ -92,7 +104,6 @@ type Provider struct {
 type providerConfig struct {
 	UpstreamProxy              string `json:"upstream_proxy"`
 	PathLen                    int    `json:"path_len"`
-	SocksListen                string `json:"socks_listen"`
 	OutboundID                 string `json:"outbound_id"`
 	FetchTimeoutSeconds        int    `json:"fetch_timeout_seconds"`
 	MaxMicrodescs              int    `json:"max_microdescs"`
@@ -103,10 +114,11 @@ type providerConfig struct {
 	AllowPrivateAddresses      bool   `json:"allow_private_addresses"`
 }
 
-// New is the ProviderFactory registered as "tor". It parses the config and
+// NewProvider is the ProviderFactory registered as "tor". It parses the config and
 // starts the tor-go client bootstrap in the background; Outbounds returns a
-// socks5 outbound once the client's listener is up, and an empty set before.
-func New(cfg map[string]any) (pub.Provider, error) {
+// "tor" protocol outbound once the client is connected, and an empty set
+// before.
+func NewProvider(cfg map[string]any) (pub.Provider, error) {
 	pc, err := parseConfig(cfg)
 	if err != nil {
 		return nil, err
@@ -123,6 +135,15 @@ func New(cfg map[string]any) (pub.Provider, error) {
 		pc.VerifySignatures = &on
 	}
 
+	// The engine injects its stack dialer under pub.StackDialerKey; route
+	// the client's own connections (guard link, directory fetches, fallback
+	// ORPorts, and the upstream SOCKS5 hop itself) through it so the plugin
+	// uses the engine's layer-3/4 stack instead of the raw system dialer.
+	var linkDialer proxy.Dialer
+	if sd := pub.AsStackDialer(cfg); sd != nil {
+		linkDialer = sd.Dial
+	}
+
 	p := &Provider{
 		cfg:     pc,
 		watchCh: make(chan struct{}, 1),
@@ -133,13 +154,37 @@ func New(cfg map[string]any) (pub.Provider, error) {
 	p.stop = cancel
 	go func() {
 		defer close(p.stopped)
-		p.run(ctx)
+		p.run(ctx, linkDialer)
 	}()
+	registerLiveProvider(p)
 	return p, nil
+}
+
+// dialStream is the in-memory dial entry for the "tor" outbound protocol:
+// it opens a Tor circuit and stream to target through the live client. The
+// outbound has already applied the target policy (onion, port 0, private).
+func (p *Provider) dialStream(ctx context.Context, target string) (net.Conn, error) {
+	p.mu.Lock()
+	cli := p.client
+	p.mu.Unlock()
+	if cli == nil {
+		return nil, errors.New("tor provider: client not running (bootstrap failed or provider stopped)")
+	}
+	stream, err := cli.DialStream(ctx, target)
+	if err != nil {
+		return nil, fmt.Errorf("tor provider: dial %s: %w", target, err)
+	}
+	return streamConn{stream}, nil
 }
 
 func parseConfig(cfg map[string]any) (providerConfig, error) {
 	// A nil config map is valid (all defaults); guard json.Marshal(nil).
+	// The engine-injected dialer values (func/interface under the reserved
+	// "_dialer"/"_upstream_dialer" keys) are ignored here: they are consumed
+	// via AsStackDialer above, and json.Marshal would choke on them.
+	cfg = maps.Clone(cfg)
+	delete(cfg, pub.StackDialerKey)
+	delete(cfg, pub.UpstreamDialerKey)
 	if cfg == nil {
 		return providerConfig{}, nil
 	}
@@ -155,15 +200,14 @@ func parseConfig(cfg map[string]any) (providerConfig, error) {
 }
 
 // run bootstraps the tor-go client, retrying with backoff until it is
-// serving, then blocks until ctx is cancelled. The client's whole lifetime is
-// tied to ctx: cancelling it stops the SOCKS5 listener, the keep-alive loop,
-// the guard link, and the hourly consensus refresh (all derived from it in
-// Serve).
-func (p *Provider) run(ctx context.Context) {
+// connected, then blocks until ctx is cancelled. The client's whole lifetime
+// is tied to ctx: cancelling it stops the keep-alive loop, the guard link,
+// and the hourly consensus refresh (all derived from it in Run).
+func (p *Provider) run(ctx context.Context, linkDialer proxy.Dialer) {
 	const maxBackoff = 60 * time.Second
 	backoff := 5 * time.Second
 	for {
-		if err := p.startOnce(ctx); err != nil {
+		if err := p.startOnce(ctx, linkDialer); err != nil {
 			if ctx.Err() != nil {
 				p.setTerminal(err)
 				return
@@ -179,21 +223,21 @@ func (p *Provider) run(ctx context.Context) {
 			}
 			continue
 		}
-		// startOnce returns only when the client's Serve exits (ctx
-		// cancelled or the listener failed); nothing left to retry.
+		// startOnce returns only when the client's Run exits (ctx
+		// cancelled); nothing left to retry.
 		return
 	}
 }
 
 // startOnce drives one full bootstrap attempt: fetch the directory, start
-// the client listening, and block on its Serve loop. It returns a nil error
-// only when Serve exits cleanly via ctx cancellation.
-func (p *Provider) startOnce(ctx context.Context) error {
+// the client, and block on its Run loop. It returns a nil error only when
+// Run exits cleanly via ctx cancellation.
+func (p *Provider) startOnce(ctx context.Context, linkDialer proxy.Dialer) error {
 	pc := p.cfg
 
-	// 1. Fetch the directory (consensus + microdescriptors) through the
-	//    upstream proxy. This is the slow part: authorities, then one HTTP
-	//    GET per microdescriptor digest.
+	// 1. Fetch the directory (consensus + microdescriptors). This is the
+	//    slow part: authorities, then one HTTP GET per microdescriptor
+	//    digest. Every fetch dials through the engine stack (linkDialer).
 	timeout := time.Duration(pc.FetchTimeoutSeconds) * time.Second
 	if timeout == 0 {
 		timeout = 5 * time.Minute
@@ -202,6 +246,7 @@ func (p *Provider) startOnce(ctx context.Context) error {
 	defer fcancel()
 	opts := directory.FetchOptions{
 		UpstreamProxy:    pc.UpstreamProxy,
+		Dialer:           linkDialer,
 		Timeout:          timeout,
 		MaxMicrodescs:    pc.MaxMicrodescs,
 		VerifySignatures: *pc.VerifySignatures,
@@ -231,13 +276,9 @@ func (p *Provider) startOnce(ctx context.Context) error {
 	}
 	log.Printf("tor provider: directory ready: %d relays (%d with onion keys)", len(dir), usable)
 
-	// 2. Build the client config. Requesting "127.0.0.1:0" (the default)
-	//    binds an ephemeral loopback port; the actual address is read back
-	//    from the listener once Serve binds it.
-	listen := p.cfg.SocksListen
-	if listen == "" {
-		listen = "127.0.0.1:0"
-	}
+	// 2. Build the client config. No SOCKS listener is configured: the
+	//    provider dials streams in memory (see dialStream), so tor-go's
+	//    Run — unlike Serve — never binds a local proxy port.
 	var linkTimeout, circTimeout time.Duration
 	if pc.LinkDialTimeoutSeconds > 0 {
 		linkTimeout = time.Duration(pc.LinkDialTimeoutSeconds) * time.Second
@@ -246,10 +287,10 @@ func (p *Provider) startOnce(ctx context.Context) error {
 		circTimeout = time.Duration(pc.CircuitBuildTimeoutSeconds) * time.Second
 	}
 	tcfg := &torclient.Config{
-		SocksAddr:             listen,
 		PathLen:               pc.PathLen,
 		Directory:             dir,
 		UpstreamProxy:         pc.UpstreamProxy,
+		LinkDialer:            linkDialer,
 		LinkDialTimeout:       linkTimeout,
 		CircuitBuildTimeout:   circTimeout,
 		AllowPrivateAddresses: pc.AllowPrivateAddresses,
@@ -261,6 +302,7 @@ func (p *Provider) startOnce(ctx context.Context) error {
 		RefreshInterval: time.Hour,
 		FetchOptions: &directory.FetchOptions{
 			UpstreamProxy:    pc.UpstreamProxy,
+			Dialer:           linkDialer,
 			Timeout:          timeout,
 			MaxMicrodescs:    pc.MaxMicrodescs,
 			VerifySignatures: *pc.VerifySignatures,
@@ -271,63 +313,66 @@ func (p *Provider) startOnce(ctx context.Context) error {
 	if err != nil {
 		return fmt.Errorf("init tor client: %w", err)
 	}
+	p.mu.Lock()
+	p.client = cli
+	p.mu.Unlock()
 
-	// 3. Serve until cancelled. Serve binds the listener, so the expected
-	//    address can only be resolved after it's up; poll the listener
-	//    surface from the client.
-	serveErr := make(chan error, 1)
+	// 3. Run until cancelled: connect the guard, keep the link alive
+	//    (padding + self-healing redial), refresh the consensus hourly. A
+	//    Connect failure is returned immediately and retried by the caller.
+	runErr := make(chan error, 1)
 	go func() {
-		serveErr <- cli.Serve(ctx)
+		runErr <- cli.Run(ctx)
 	}()
-	if err := p.awaitListener(ctx, cli, serveErr, 15*time.Second); err != nil {
-		return fmt.Errorf("listener startup: %w", err)
+	if err := p.awaitConnected(ctx, cli, runErr, 15*time.Second); err != nil {
+		p.clearClient()
+		return fmt.Errorf("guard connection: %w", err)
 	}
 
-	// 4. Block until Serve exits. Cancelling ctx stops the listener and
-	//    closes the guard link; a Serve failure (e.g. bind error) is
-	//    retried by the caller.
+	// 4. Block until Run exits. Cancelling ctx closes the guard link and
+	//    stops the background loops; a Run failure is retried by the caller.
 	select {
 	case <-ctx.Done():
-		<-serveErr
+		<-runErr
+		p.clearClient()
 		return nil
-	case err := <-serveErr:
+	case err := <-runErr:
 		p.setNotReady()
-		return fmt.Errorf("serve exited: %w", err)
+		p.clearClient()
+		return fmt.Errorf("run exited: %w", err)
 	}
 }
 
-// awaitListener blocks until the client's SOCKS5 listener answers on its
-// bound address or the timeout elapses. The listener binds inside Serve, so
-// the actual address is read back from the client rather than assumed. If
-// Serve exits early (guard connect or bind failure) its error is returned
-// immediately instead of spinning until the timeout.
-func (p *Provider) awaitListener(ctx context.Context, cli *torclient.Client, serveErr <-chan error, timeout time.Duration) error {
+// clearClient drops the client reference so dials fail fast instead of
+// hitting a client whose Run loop has exited.
+func (p *Provider) clearClient() {
+	p.mu.Lock()
+	p.client = nil
+	p.mu.Unlock()
+}
+
+// awaitConnected blocks until the client reports a live guard link, Run
+// exits early (connect failure), or the timeout elapses.
+func (p *Provider) awaitConnected(ctx context.Context, cli *torclient.Client, runErr <-chan error, timeout time.Duration) error {
 	deadline := time.Now().Add(timeout)
 	for time.Now().Before(deadline) {
 		select {
 		case <-ctx.Done():
 			return ctx.Err()
-		case err := <-serveErr:
-			return fmt.Errorf("serve exited before listening: %w", err)
+		case err := <-runErr:
+			return fmt.Errorf("run exited before connecting: %w", err)
 		case <-time.After(100 * time.Millisecond):
 		}
-		addr := cli.SocksAddr()
-		if addr == "" {
-			continue
-		}
-		conn, err := net.DialTimeout("tcp", addr, 300*time.Millisecond)
-		if err == nil {
-			conn.Close()
+		if cli.Connected() {
 			p.mu.Lock()
-			p.listenOn = addr
 			p.ready = true
 			p.mu.Unlock()
-			log.Printf("tor provider: tor-go SOCKS5 listener up at %s", addr)
+			log.Printf("tor provider: tor-go client connected to guard")
 			p.signalWatch()
 			return nil
 		}
 	}
-	return errors.New("timeout waiting for SOCKS5 listener")
+	return errors.New("timeout waiting for guard connection")
 }
 
 // setTerminal records a startup error and wakes the engine for one final
@@ -353,44 +398,47 @@ func (p *Provider) Name() string { return "tor" }
 func (p *Provider) Watch() <-chan struct{} { return p.watchCh }
 
 // Outbounds returns the current outbound set: empty until the tor-go client
-// is listening, then a single socks5 outbound pointing at its loopback
-// SOCKS5 listener. A terminal bootstrap failure returns the error so the
-// engine logs it (the existing pool, if any, is kept).
+// is connected, then a single outbound of the "tor" protocol, which dials
+// circuits in memory through this provider. A terminal bootstrap failure
+// returns the error so the engine logs it (the existing pool, if any, is
+// kept).
 func (p *Provider) Outbounds(_ context.Context) ([]pub.OutboundConfig, error) {
 	p.mu.Lock()
 	ready := p.ready
-	addr := p.listenOn
 	err := p.startErr
 	id := p.cfg.OutboundID
+	allowPrivate := p.cfg.AllowPrivateAddresses
 	p.mu.Unlock()
 	if err != nil {
 		return nil, err
 	}
-	if !ready || addr == "" {
+	if !ready {
 		return nil, nil
 	}
 	return []pub.OutboundConfig{
 		{
 			ID:       id,
-			Protocol: "socks5",
+			Protocol: "tor",
 			Config: map[string]any{
-				"id":      id,
-				"address": addr,
+				"id":            id,
+				"tunnel":        id,
+				"allow_private": allowPrivate,
 			},
 		},
 	}, nil
 }
 
 // Close stops the tor-go client and waits for the goroutine to exit. The
-// engine's provider manager does not call Close on providers; this exists
-// for embedders and tests that manage the provider lifecycle themselves.
+// engine's provider manager calls Close on stopped providers.
 func (p *Provider) Close() error {
+	unregisterLiveProvider(p)
 	if p.stop != nil {
 		p.stop()
 	}
 	<-p.stopped
 	p.mu.Lock()
 	p.ready = false
+	p.client = nil
 	p.mu.Unlock()
 	return nil
 }

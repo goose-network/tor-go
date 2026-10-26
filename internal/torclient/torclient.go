@@ -1,14 +1,22 @@
 // Package torclient is the top-level Tor client. It owns the directory, the
 // guard link, a pool of circuits, and the SOCKS5 listener. Applications
-// configure it with a SOCKS5 proxy address (default 127.0.0.1:7890) and
-// route traffic through it.
+// either configure it with a SOCKS5 proxy address (default 127.0.0.1:7890)
+// and route traffic through it, or embed it in process and dial streams
+// directly with no listener at all.
 //
-// Lifecycle:
+// Lifecycle (serving SOCKS5):
 //
 //	cfg := &torclient.Config{SocksAddr: "127.0.0.1:7890", PathLen: 3}
 //	cli, err := torclient.New(ctx, cfg)
 //	...
 //	cli.Serve(ctx)   // blocks, serving SOCKS5
+//
+// Lifecycle (embedded, no listener — what the goose plugin uses):
+//
+//	cfg := &torclient.Config{PathLen: 3, LinkDialer: myStack}
+//	cli, _ := torclient.New(ctx, cfg)
+//	go cli.Run(ctx)          // connects the guard, keeps the link alive
+//	stream, _ := cli.DialStream(ctx, "example.org:443")
 package torclient
 
 import (
@@ -25,6 +33,7 @@ import (
 	"github.com/goose-network/tor-go/internal/directory"
 	"github.com/goose-network/tor-go/internal/guard"
 	"github.com/goose-network/tor-go/internal/link"
+	"github.com/goose-network/tor-go/internal/proxy"
 	"github.com/goose-network/tor-go/internal/socks5"
 )
 
@@ -47,6 +56,14 @@ type Config struct {
 	// Clash/V2Ray instance). Empty means dial relays directly. This lets
 	// tor-go reach the Tor network from behind an upstream proxy.
 	UpstreamProxy string
+	// LinkDialer, when non-nil, establishes the raw TCP connection for
+	// every outbound hop of the client: the guard link, directory fetches,
+	// fallback ORPorts, and the connection to UpstreamProxy itself. It is
+	// how an embedding process routes the client's own traffic through its
+	// network stack (a userspace IP stack, a VPN, …) instead of the system
+	// dialer; the TLS and Tor handshakes are layered on top unchanged. Nil
+	// is the system dialer.
+	LinkDialer proxy.Dialer
 	// LinkDialTimeout is the timeout for connecting to the guard.
 	LinkDialTimeout time.Duration
 	// CircuitBuildTimeout is the timeout for building a circuit.
@@ -256,7 +273,7 @@ func (c *Client) Connect(ctx context.Context) error {
 func (c *Client) dialGuard(ctx context.Context, r *directory.Router, guardID string) error {
 	dctx, cancel := context.WithTimeout(ctx, c.cfg.LinkDialTimeout)
 	defer cancel()
-	l, err := link.DialWithUpstream(dctx, c.cfg.UpstreamProxy, r.Address, r.IDDigest[:], r.Ed25519ID)
+	l, err := link.DialWithDialer(dctx, c.cfg.LinkDialer, c.cfg.UpstreamProxy, r.Address, r.IDDigest[:], r.Ed25519ID)
 	if err != nil {
 		return fmt.Errorf("connect to guard %s: %w", r.Address, err)
 	}
@@ -379,6 +396,57 @@ func (c *Client) Serve(ctx context.Context) error {
 	}
 }
 
+// Run connects to the guard and keeps the client alive without serving the
+// SOCKS5 listener: link padding and self-healing redial (see keepAliveLoop)
+// and, when RefreshInterval is set, the background consensus refresh. It is
+// Serve for embedders that dial streams in process via DialStream instead
+// of through a SOCKS5 client, so no loopback listener is bound at all.
+//
+// A Connect failure is returned immediately (the caller may retry); the
+// client runs until ctx is cancelled, then the guard link is closed and
+// ctx.Err() is returned.
+func (c *Client) Run(ctx context.Context) error {
+	if err := c.Connect(ctx); err != nil {
+		return err
+	}
+	// Same keep-alive derivation as Serve: the loop never outlives the caller.
+	kctx, kcancel := context.WithCancel(ctx)
+	defer kcancel()
+	go c.keepAliveLoop(kctx)
+	if c.cfg.RefreshInterval > 0 {
+		go c.refreshLoop(ctx)
+	}
+	<-ctx.Done()
+	c.mu.Lock()
+	if c.link != nil {
+		c.link.Close()
+	}
+	c.closed = true
+	c.mu.Unlock()
+	return ctx.Err()
+}
+
+// Connected reports whether the guard link is up and alive — whether
+// DialStream can build circuits right now. Embedders poll it to learn when
+// the client is usable (Run connects asynchronously to their polling).
+func (c *Client) Connected() bool {
+	c.mu.Lock()
+	l := c.link
+	c.mu.Unlock()
+	return l != nil && l.IsAlive()
+}
+
+// DialStream opens a Tor circuit and stream to target (host:port) in
+// process: the embedder receives the same stream a SOCKS5 CONNECT client
+// would, without a loopback listener. The circuit build and stream open are
+// identical to the SOCKS path (fresh circuit per stream). Callers that
+// accept untrusted targets should apply the same target policy the SOCKS5
+// server does (socks5.IsOnionHost, port 0, socks5.RejectPrivateTarget
+// gated on AllowPrivateAddresses).
+func (c *Client) DialStream(ctx context.Context, target string) (io.ReadWriteCloser, error) {
+	return (&dialer{client: c}).DialStream(ctx, target)
+}
+
 // refreshLoop periodically re-fetches the consensus and swaps the client's
 // directory in place. A refresh failure is logged but does not stop the loop
 // (the client keeps serving with the last good directory); the next tick
@@ -426,10 +494,14 @@ func (c *Client) fetchOpts() *directory.FetchOptions {
 		if opts.UpstreamProxy == "" {
 			opts.UpstreamProxy = c.cfg.UpstreamProxy
 		}
+		if opts.Dialer == nil {
+			opts.Dialer = c.cfg.LinkDialer
+		}
 		return &opts
 	}
 	return &directory.FetchOptions{
 		UpstreamProxy: c.cfg.UpstreamProxy,
+		Dialer:        c.cfg.LinkDialer,
 		Timeout:       5 * time.Minute,
 	}
 }

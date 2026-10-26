@@ -301,7 +301,7 @@ func (s *Server) handleConnect(ctx context.Context, conn net.Conn, host string, 
 	// subsystem (introduction-point / rendezvous circuits), which this client
 	// does not implement. Refuse them explicitly with "command not supported"
 	// rather than sending them to a normal exit, which cannot resolve .onion.
-	if isOnionHost(host) {
+	if IsOnionHost(host) {
 		log.Printf("socks5: refusing .onion target %s (hidden services unsupported)", target)
 		reply(conn, repCmdNotSupported, nil, 0)
 		return
@@ -325,7 +325,7 @@ func (s *Server) handleConnect(ctx context.Context, conn net.Conn, host string, 
 	// allowed (the exit resolves them and applies its own exit policy).
 	// Gated on RejectPrivateAddresses (off by default; the real client
 	// enables it) so loopback test targets still work.
-	if s.RejectPrivateAddresses && rejectPrivateTarget(host) {
+	if s.RejectPrivateAddresses && RejectPrivateTarget(host) {
 		log.Printf("socks5: refusing private/local target %s", target)
 		reply(conn, repNotAllowed, nil, 0)
 		return
@@ -346,20 +346,27 @@ func (s *Server) handleConnect(ctx context.Context, conn net.Conn, host string, 
 	pipe(conn, stream)
 }
 
-// isOnionHost reports whether host is a .onion hidden-service address (case-
+// IsOnionHost reports whether host is a .onion hidden-service address (case-
 // insensitive, matching the standard v2/v3 suffix).
-func isOnionHost(host string) bool {
+//
+// Exported for the in-process dial path: torclient callers that dial streams
+// directly (rather than through a SOCKS client) apply the same target policy
+// the SOCKS server does.
+func IsOnionHost(host string) bool {
 	return strings.HasSuffix(strings.ToLower(host), ".onion")
 }
 
-// rejectPrivateTarget reports whether a CONNECT/RESOLVE target should be
+// RejectPrivateTarget reports whether a CONNECT/RESOLVE target should be
 // refused at the SOCKS layer as a private or local address. It mirrors the
 // C client's ClientRejectInternalAddresses path (connection_edge.c:2380):
 // the "localhost"/"local"/"*.local" hostnames (tor_addr_hostname_is_local)
 // and any IP literal that tor_addr_is_internal_ considers internal. A
 // non-IP hostname is allowed (the exit resolves it and enforces its exit
 // policy). Returns false for an empty host (handled elsewhere).
-func rejectPrivateTarget(host string) bool {
+//
+// Exported for the same reason as IsOnionHost: the in-process dial path
+// enforces the same policy the SOCKS server does.
+func RejectPrivateTarget(host string) bool {
 	if host == "" {
 		return false
 	}
@@ -388,12 +395,12 @@ func isInternalIP(ip net.IP) bool {
 		o0, o1 := v4[0], v4[1]
 		switch {
 		case o0 == 0, // 0/8
-			o0 == 10, // 10/8
-			o0 == 127, // 127/8
+			o0 == 10,                           // 10/8
+			o0 == 127,                          // 127/8
 			o0 == 100 && o1 >= 64 && o1 <= 127, // 100.64/10
-			o0 == 169 && o1 == 254, // 169.254/16
-			o0 == 172 && o1 >= 16 && o1 <= 31, // 172.16/12
-			o0 == 192 && o1 == 168: // 192.168/16
+			o0 == 169 && o1 == 254,             // 169.254/16
+			o0 == 172 && o1 >= 16 && o1 <= 31,  // 172.16/12
+			o0 == 192 && o1 == 168:             // 192.168/16
 			return true
 		}
 		return false
@@ -429,7 +436,7 @@ func isInternalIP(ip net.IP) bool {
 // through the Tor exit and reply with the address.
 func (s *Server) handleResolve(ctx context.Context, conn net.Conn, host string) {
 	log.Printf("socks5: RESOLVE %s", host)
-	if s.RejectPrivateAddresses && rejectPrivateTarget(host) {
+	if s.RejectPrivateAddresses && RejectPrivateTarget(host) {
 		log.Printf("socks5: refusing RESOLVE of private/local target %s", host)
 		reply(conn, repNotAllowed, nil, 0)
 		return
@@ -452,7 +459,7 @@ func (s *Server) handleResolve(ctx context.Context, conn net.Conn, host string) 
 // resolve an IP to a hostname through the Tor exit.
 func (s *Server) handleResolvePtr(ctx context.Context, conn net.Conn, host string) {
 	log.Printf("socks5: RESOLVE_PTR %s", host)
-	if s.RejectPrivateAddresses && rejectPrivateTarget(host) {
+	if s.RejectPrivateAddresses && RejectPrivateTarget(host) {
 		log.Printf("socks5: refusing RESOLVE_PTR of private/local target %s", host)
 		reply(conn, repNotAllowed, nil, 0)
 		return

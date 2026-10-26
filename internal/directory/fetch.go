@@ -122,6 +122,13 @@ type FetchOptions struct {
 	// in order until one succeeds. When false (the default), the HTTPS
 	// authority path is used.
 	UseFallbacks bool
+
+	// Dialer, when non-nil, establishes the raw TCP connection for every
+	// directory fetch: the connection to the authority (no upstream) or to
+	// the upstream SOCKS5 proxy (UpstreamProxy set), and the fallback
+	// relays' ORPorts. Embedders use it to route the client's own traffic
+	// through their network stack; nil is the system dialer.
+	Dialer proxy.Dialer
 }
 
 // Fetch downloads a real microconsensus and its microdescriptors, parses them,
@@ -157,7 +164,7 @@ func FetchWithMeta(ctx context.Context, opts FetchOptions) (map[string]*Router, 
 		return fetchViaFallbackCircuit(ctx, opts)
 	}
 
-	client := &http.Client{Transport: &dialTransport{upstream: opts.UpstreamProxy}, Timeout: 0}
+	client := &http.Client{Transport: &dialTransport{upstream: opts.UpstreamProxy, dialer: opts.Dialer}, Timeout: 0}
 
 	// 1. Fetch the microconsensus, retrying across authorities with
 	//    exponential backoff. Each round tries every authority in order; if
@@ -283,6 +290,7 @@ func FetchWithMeta(ctx context.Context, opts FetchOptions) (map[string]*Router, 
 // minimal client).
 type dialTransport struct {
 	upstream string
+	dialer   proxy.Dialer
 }
 
 func (t *dialTransport) RoundTrip(req *http.Request) (*http.Response, error) {
@@ -297,7 +305,7 @@ func (t *dialTransport) RoundTrip(req *http.Request) (*http.Response, error) {
 			host = net.JoinHostPort(host, "80")
 		}
 	}
-	conn, err := proxy.Dial(ctx, t.upstream, host)
+	conn, err := proxy.DialWithDialer(ctx, t.dialer, t.upstream, host)
 	if err != nil {
 		return nil, fmt.Errorf("directory: dial %s: %w", host, err)
 	}

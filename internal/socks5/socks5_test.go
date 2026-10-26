@@ -103,9 +103,9 @@ func TestRejectPrivateTarget(t *testing.T) {
 		{"", false}, // empty handled elsewhere
 	}
 	for _, c := range cases {
-		got := rejectPrivateTarget(c.host)
+		got := RejectPrivateTarget(c.host)
 		if got != c.want {
-			t.Errorf("rejectPrivateTarget(%q) = %v, want %v", c.host, got, c.want)
+			t.Errorf("RejectPrivateTarget(%q) = %v, want %v", c.host, got, c.want)
 		}
 	}
 }

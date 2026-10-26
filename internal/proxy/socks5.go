@@ -32,30 +32,60 @@ const (
 	repSuccess   = 0x00
 )
 
+// Dialer establishes the raw TCP connection underlying every outbound hop
+// of the client: link-layer connections to relays, directory fetches, and
+// the connection to an upstream SOCKS5 proxy itself. Embedders supply one
+// to route these connections through their own network stack (a userspace
+// IP stack, a VPN, …) instead of the system dialer. A nil Dialer behaves
+// exactly like the system dialer.
+type Dialer func(ctx context.Context, network, address string) (net.Conn, error)
+
 // Dial connects to target (host:port) by first establishing a TCP connection
 // to the SOCKS5 proxy at proxyAddr and performing a SOCKS5 CONNECT. It returns
 // the resulting stream, which a caller can then layer TLS on top of. If
 // proxyAddr is empty, Dial dials target directly (no proxy).
 func Dial(ctx context.Context, proxyAddr, target string) (net.Conn, error) {
+	return DialWithDialer(ctx, nil, proxyAddr, target)
+}
+
+// DialWithDialer is Dial with the raw TCP hop dialed through d: the
+// connection to the target (no upstream) or to the upstream proxy (SOCKS5
+// path) is established with d, then TLS / the SOCKS5 handshake are layered
+// on top as usual. A nil d is the system dialer.
+func DialWithDialer(ctx context.Context, d Dialer, proxyAddr, target string) (net.Conn, error) {
 	if proxyAddr == "" {
-		d := &net.Dialer{}
-		return d.DialContext(ctx, "tcp", target)
+		if d != nil {
+			return d(ctx, "tcp", target)
+		}
+		sys := &net.Dialer{}
+		return sys.DialContext(ctx, "tcp", target)
 	}
-	return dialSOCKS5(ctx, proxyAddr, target)
+	return dialSOCKS5(ctx, d, proxyAddr, target)
 }
 
 // dialSOCKS5 connects to proxyAddr, performs the SOCKS5 no-auth greeting and a
-// CONNECT to target, and returns the tunneled connection.
-func dialSOCKS5(ctx context.Context, proxyAddr, target string) (net.Conn, error) {
+// CONNECT to target, and returns the tunneled connection. The TCP connection
+// to the proxy itself is dialed through d (nil = system dialer).
+func dialSOCKS5(ctx context.Context, d Dialer, proxyAddr, target string) (net.Conn, error) {
 	deadline, ok := ctx.Deadline()
 	if !ok {
 		deadline = time.Now().Add(30 * time.Second)
 	}
 
-	d := &net.Dialer{Timeout: time.Until(deadline)}
-	conn, err := d.DialContext(ctx, "tcp", proxyAddr)
-	if err != nil {
-		return nil, fmt.Errorf("proxy: dial socks5 %s: %w", proxyAddr, err)
+	var conn net.Conn
+	if d != nil {
+		var err error
+		conn, err = d(ctx, "tcp", proxyAddr)
+		if err != nil {
+			return nil, fmt.Errorf("proxy: dial socks5 %s: %w", proxyAddr, err)
+		}
+	} else {
+		dl := &net.Dialer{Timeout: time.Until(deadline)}
+		var err error
+		conn, err = dl.DialContext(ctx, "tcp", proxyAddr)
+		if err != nil {
+			return nil, fmt.Errorf("proxy: dial socks5 %s: %w", proxyAddr, err)
+		}
 	}
 	conn.SetDeadline(deadline)
 

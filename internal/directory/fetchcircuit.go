@@ -55,7 +55,7 @@ func fetchFromOneFallback(ctx context.Context, opts FetchOptions, fb fallback.Fa
 	// The TLS link authenticates the relay; CREATE_FAST then derives circuit
 	// keys without needing the relay's onion key (which the fallback list
 	// does not carry).
-	l, err := link.DialWithUpstream(ctx, opts.UpstreamProxy, addr, fb.RSAFingerprint[:], [32]byte{})
+	l, err := link.DialWithDialer(ctx, opts.Dialer, opts.UpstreamProxy, addr, fb.RSAFingerprint[:], [32]byte{})
 	if err != nil {
 		return nil, nil, fmt.Errorf("dial fallback %s: %w", fb.HexFingerprint(), err)
 	}
