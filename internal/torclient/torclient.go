@@ -24,6 +24,7 @@ import (
 	"errors"
 	"fmt"
 	"io"
+	"strings"
 	"log"
 	"net"
 	"sync"
@@ -447,6 +448,106 @@ func (c *Client) DialStream(ctx context.Context, target string) (io.ReadWriteClo
 	return (&dialer{client: c}).DialStream(ctx, target)
 }
 
+// RouterInfo is a snapshot of one directory relay in the form embedders
+// consume: the identity a circuit path carries, plus the display address
+// and exit flag that drive per-exit outbound emission.
+type RouterInfo struct {
+	Nickname string
+	IDDigest string // hex-encoded 20-byte identity digest; keys the directory map
+	Address  string // "ip:port"
+	IsExit   bool
+}
+
+// Client implements streamDialer; embedders that need the per-exit view use
+// the RouterInfo surface on this concrete type.
+var _ interface {
+	DialStream(context.Context, string) (io.ReadWriteCloser, error)
+} = (*Client)(nil)
+
+// ExitInfos returns a snapshot of the current exit-relay roster: relays with
+// the Exit flag and a usable ntor key, whether the client is connected right
+// now or not. Embedders (e.g. the goose provider) use it to emit one outbound
+// per real exit relay. The directory map is swapped whole on refresh, so the
+// returned slice is a stable snapshot.
+func (c *Client) ExitInfos() []RouterInfo {
+	dir := c.directory()
+	out := make([]RouterInfo, 0, len(dir))
+	for _, r := range dir {
+		if !routerHasFlag(r, "Exit") || r.OnionKey == ([32]byte{}) {
+			continue
+		}
+		out = append(out, RouterInfo{
+			Nickname: r.Nickname,
+			IDDigest: hexIDDigest(r),
+			Address:  r.Address,
+			IsExit:    true,
+		})
+	}
+	return out
+}
+
+// RouterByIDDigest looks a relay up by its hex-encoded identity digest — the
+// same string ExitInfos reports and directory consensus lines key on. It
+// returns a distinct error when the digest is not valid hex of the right
+// length, so callers can tell bad input apart from a relay that has left
+// the directory since it was listed.
+func (c *Client) RouterByIDDigest(key string) (*directory.Router, error) {
+	id, err := hexDecode(key)
+	if err != nil {
+		return nil, fmt.Errorf("torclient: bad exit digest %q: %w", key, err)
+	}
+	// directory keys are lowercase hex of the same 20 bytes; normalize so an
+	// uppercase digest from user config still matches.
+	const hexDigits = "0123456789abcdef"
+	normalized := make([]byte, 40)
+	for i, v := range id {
+		normalized[2*i] = hexDigits[v>>4]
+		normalized[2*i+1] = hexDigits[v&0x0f]
+	}
+	c.mu.Lock()
+	defer c.mu.Unlock()
+	return c.dir[string(normalized)], nil
+}
+
+// hexDecode decodes exactly 40 hex characters into 20 bytes.
+func hexDecode(s string) ([]byte, error) {
+	if len(s) != 40 {
+		return nil, errors.New("expected 40 hex characters")
+	}
+	out := make([]byte, 20)
+	for i := 0; i < 40; i += 2 {
+		hi, ok1 := hexVal(s[i])
+		lo, ok2 := hexVal(s[i+1])
+		if !ok1 || !ok2 {
+			return nil, errors.New("invalid hex character")
+		}
+		out[i/2] = hi<<4 | lo
+	}
+	return out, nil
+}
+
+func hexVal(ch byte) (byte, bool) {
+	switch {
+	case ch >= '0' && ch <= '9':
+		return ch - '0', true
+	case ch >= 'a' && ch <= 'f':
+		return ch - 'a' + 10, true
+	case ch >= 'A' && ch <= 'F':
+		return ch - 'A' + 10, true
+	}
+	return 0, false
+}
+
+// DialStreamViaExit opens a Tor circuit and stream to target whose exit hop is
+// pinned to the named relay (hex identity digest, as reported by ExitInfos),
+// instead of letting buildPath pick the exit randomly per circuit. Everything
+// else matches DialStream: fresh circuit per stream, same stream semantics.
+// The pinned relay re-enters the eligible exit set only while it stays in the
+// directory; when it drops out, dials fail fast with the lookup error.
+func (c *Client) DialStreamViaExit(ctx context.Context, hexDigest, target string) (io.ReadWriteCloser, error) {
+	return (&dialer{client: c, pinnedExit: strings.ToLower(hexDigest)}).DialStream(ctx, target)
+}
+
 // refreshLoop periodically re-fetches the consensus and swaps the client's
 // directory in place. A refresh failure is logged but does not stop the loop
 // (the client keeps serving with the last good directory); the next tick
@@ -508,8 +609,13 @@ func (c *Client) fetchOpts() *directory.FetchOptions {
 
 // dialer implements socks5.Dialer by building a fresh circuit per stream
 // (a simple, isolation-friendly strategy) and opening a stream through it.
+// pinnedExit, when non-empty, is the digest of the relay the circuit's exit
+// hop must be (per-exit pinning; see DialStreamViaExit). It lives on the
+// dialer rather than the client so one client can serve both pinned and
+// unpinned streams concurrently.
 type dialer struct {
-	client *Client
+	client     *Client
+	pinnedExit string
 }
 
 // DialStream opens a Tor circuit and a stream to target. Each call builds a
@@ -536,7 +642,7 @@ func (d *dialer) DialStream(ctx context.Context, target string) (io.ReadWriteClo
 		}
 	}
 
-	path, err := c.buildPath()
+	path, err := c.buildPath(d.pinnedExit)
 	if err != nil {
 		return nil, err
 	}
@@ -559,7 +665,9 @@ func (d *dialer) DialStream(ctx context.Context, target string) (io.ReadWriteClo
 }
 
 // buildPath selects the relays for a circuit of the configured length.
-func (c *Client) buildPath() ([]link.RouterIdentity, error) {
+// pinnedExit, when non-empty, is the digest of the relay pinned as the last
+// hop (the per-exit dial form); empty keeps the random exit selection.
+func (c *Client) buildPath(pinnedExit string) ([]link.RouterIdentity, error) {
 	dir := c.directory()
 	path := make([]link.RouterIdentity, 0, c.cfg.PathLen)
 	c.mu.Lock()
@@ -570,9 +678,22 @@ func (c *Client) buildPath() ([]link.RouterIdentity, error) {
 	for i := 1; i < c.cfg.PathLen; i++ {
 		var r *directory.Router
 		var err error
-		if i == c.cfg.PathLen-1 {
+		switch {
+		case i == c.cfg.PathLen-1 && pinnedExit != "":
+			pinned, err := c.RouterByIDDigest(pinnedExit)
+			if err != nil {
+				return nil, err
+			}
+			if pinned == nil {
+				return nil, fmt.Errorf("torclient: pinned exit %q is not in the current directory (it may have left the relay set)", pinnedExit)
+			}
+			if pinned.OnionKey == ([32]byte{}) {
+				return nil, fmt.Errorf("torclient: pinned exit %q has no onion key", pinnedExit)
+			}
+			r = pinned
+		case i == c.cfg.PathLen-1:
 			r, err = directory.SelectExit(dir)
-		} else {
+		default:
 			r, err = directory.SelectMiddle(dir)
 		}
 		if err != nil {
@@ -627,7 +748,7 @@ func (d *dialer) Resolve(ctx context.Context, hostname string) (string, error) {
 	if l == nil {
 		return "", errors.New("torclient: not connected to guard")
 	}
-	path, err := c.buildPath()
+	path, err := c.buildPath("")
 	if err != nil {
 		return "", err
 	}
@@ -657,7 +778,7 @@ func (d *dialer) ResolvePtr(ctx context.Context, ip string) (string, error) {
 	if l == nil {
 		return "", errors.New("torclient: not connected to guard")
 	}
-	path, err := c.buildPath()
+	path, err := c.buildPath("")
 	if err != nil {
 		return "", err
 	}

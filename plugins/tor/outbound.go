@@ -1,9 +1,11 @@
 // outbound.go — the "tor" outbound protocol: dials streams in memory through
-// a live provider's embedded tor-go client. The provider emits ONE outbound
-// of this protocol (config {"tunnel": <outbound id>}); at dial time the
-// outbound resolves the live provider from the registry below and calls its
-// dialStream, so no SOCKS/HTTP hop exists between goose and the Tor client —
-// the connection goose hands to the router IS the Tor circuit's stream.
+// a live provider's embedded tor-go client. The provider emits the general
+// outbound (config {"tunnel": <outbound id>}, random exit per circuit) plus
+// one per-relay outbound (also carrying {"exit": <hex identity digest>},
+// which pins the circuit's exit hop); at dial time the outbound resolves the
+// live provider from the registry below and calls its dial path, so no
+// SOCKS/HTTP hop exists between goose and the Tor client — the connection
+// goose hands to the router IS the Tor circuit's stream.
 //
 // The registry is keyed by the general outbound ID (the engine enforces
 // unique outbound IDs, so two tor providers must use distinct outbound_id
@@ -52,17 +54,23 @@ func lookupLiveProvider(id string) (*Provider, bool) {
 
 // Outbound is the "tor" protocol outbound. tunnel names the live provider
 // (its outbound ID); allowPrivate mirrors the provider's
-// allow_private_addresses into the dial path.
+// allow_private_addresses into the dial path; exitDigest, when non-empty,
+// pins the circuit's exit hop to one relay (the per-server form of the tor
+// outbound — see Provider.Outbounds).
 type Outbound struct {
 	id           string
 	tunnel       string
 	allowPrivate bool
+	exitDigest   string
+	exitName     string
 }
 
 // New is the pub.OutboundFactory registered as "tor". The config map is the
-// provider-emitted {"id", "tunnel", "allow_private"}; the engine-injected
-// "_dialer" key (StackDialer) is intentionally ignored — the tor client's
-// own connections already dial through the engine stack via the provider.
+// provider-emitted {"id", "tunnel", "allow_private"} for the general
+// outbound, plus {"exit": <hex digest>, "exit_name": <nickname>} on
+// per-relay outbounds; the engine-injected "_dialer" key (StackDialer) is
+// intentionally ignored — the tor client's own connections already dial
+// through the engine stack via the provider.
 func New(cfg map[string]any) (pub.Outbound, error) {
 	id, _ := cfg["id"].(string)
 	if id == "" {
@@ -73,17 +81,33 @@ func New(cfg map[string]any) (pub.Outbound, error) {
 		tunnel = id
 	}
 	allowPrivate, _ := cfg["allow_private"].(bool)
-	return &Outbound{id: id, tunnel: tunnel, allowPrivate: allowPrivate}, nil
+	exitDigest, _ := cfg["exit"].(string)
+	exitName, _ := cfg["exit_name"].(string)
+	return &Outbound{id: id, tunnel: tunnel, allowPrivate: allowPrivate, exitDigest: exitDigest, exitName: exitName}, nil
 }
 
 func (o *Outbound) Protocol() string { return "tor" }
 
 func (o *Outbound) ID() string { return o.id }
 
-// Address is empty: a Tor circuit has no single dial endpoint (the exit is
-// chosen per stream), so there is nothing for the engine to probe or
-// geolocate; liveness is the dial itself.
-func (o *Outbound) Address() string { return "" }
+// Address reports the pinned exit relay's OR address on per-relay outbounds
+// (giving the engine something to show, geolocate, and probe for
+// reachability); the general outbound has no single endpoint, so it stays
+// empty.
+func (o *Outbound) Address() string {
+	if o.exitDigest == "" {
+		return ""
+	}
+	p, ok := lookupLiveProvider(o.tunnel)
+	if !ok {
+		return ""
+	}
+	addr, err := p.exitAddress(o.exitDigest)
+	if err != nil {
+		return ""
+	}
+	return addr
+}
 
 func (o *Outbound) Location() *pub.Location  { return nil }
 func (o *Outbound) Stats() pub.OutboundStats { return pub.OutboundStats{} }
@@ -114,7 +138,7 @@ func (o *Outbound) DialContext(ctx context.Context, network pub.Network, address
 	if !ok {
 		return nil, fmt.Errorf("tor: no live provider for tunnel %q (is the tor provider running?)", o.tunnel)
 	}
-	return p.dialStream(ctx, address)
+	return p.dialStreamExit(ctx, o.exitDigest, address)
 }
 
 func init() {

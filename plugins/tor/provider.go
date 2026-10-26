@@ -3,11 +3,16 @@
 // Go Tor client — as a library and exposes it to goose the same way the
 // Psiphon provider embeds tunnel-core: the provider bootstraps a real Tor
 // client (directory fetch, guard link, circuit pool) in the background, and
-// once the client is connected it emits ONE goose outbound of protocol
-// "tor". Dials through that outbound open a Tor circuit IN PROCESS — the
-// outbound calls the client's DialStream directly — so there is no SOCKS/HTTP
-// hop between goose and the Tor client, and the client's own connections
-// (guard link, directory fetches) dial through the engine's layer-3/4 stack.
+// once the client is connected it emits the goose outbound set — a general
+// "tor" outbound plus ONE outbound per Exit-flagged relay in the client's
+// directory (the tor analogue of the psiphon provider's per-server list), so
+// the engine's web UI can show the real relay roster and any relay can be
+// pinned per inbound or pool. Dials through any of these outbounds open a Tor
+// circuit IN PROCESS — the outbound calls the client's DialStream directly
+// (with the exit hop pinned on per-relay outbounds) — so there is no
+// SOCKS/HTTP hop between goose and the Tor client, and the client's own
+// connections (guard link, directory fetches) dial through the engine's
+// layer-3/4 stack.
 //
 // This package lives inside the tor-go module (not a separate repo) because
 // it embeds tor-go's internal packages (internal/torclient, internal/directory),
@@ -74,9 +79,24 @@ func init() {
 
 // streamDialer is the tor-go client surface dialStream needs;
 // *torclient.Client implements it. An interface keeps the dial path testable
-// without a full Tor bootstrap.
+// without a full Tor bootstrap. Per-exit pinning is a separate interface
+// (exitLister / exitPinner) the concrete client also implements.
 type streamDialer interface {
 	DialStream(ctx context.Context, target string) (io.ReadWriteCloser, error)
+}
+
+// exitLister reports the relay roster for per-exit outbound emission. It is
+// the Provider-facing slice of *torclient.Client's ExitInfos.
+type exitLister interface {
+	// ExitInfos returns one entry per Exit-flagged relay currently in the
+	// directory, keyed by hex identity digest.
+	ExitInfos() []torclient.RouterInfo
+}
+
+// exitPinner is the dial form behind a per-exit outbound: the circuit's exit
+// hop is pinned to the named relay instead of chosen randomly per stream.
+type exitPinner interface {
+	DialStreamViaExit(ctx context.Context, hexDigest, target string) (io.ReadWriteCloser, error)
 }
 
 // Provider is a goose outbound provider backed by an embedded tor-go client.
@@ -164,17 +184,54 @@ func NewProvider(cfg map[string]any) (pub.Provider, error) {
 // it opens a Tor circuit and stream to target through the live client. The
 // outbound has already applied the target policy (onion, port 0, private).
 func (p *Provider) dialStream(ctx context.Context, target string) (net.Conn, error) {
+	return p.dialStreamExit(ctx, "", target)
+}
+
+// dialStreamExit is dialStream with the circuit's exit hop optionally pinned
+// to one relay (hex identity digest; empty = random exit per stream). Dials
+// through a per-exit outbound land here with the digest that outbound
+// carries.
+func (p *Provider) dialStreamExit(ctx context.Context, exitDigest, target string) (net.Conn, error) {
 	p.mu.Lock()
 	cli := p.client
 	p.mu.Unlock()
 	if cli == nil {
 		return nil, errors.New("tor provider: client not running (bootstrap failed or provider stopped)")
 	}
-	stream, err := cli.DialStream(ctx, target)
+	var stream io.ReadWriteCloser
+	var err error
+	if exitDigest == "" {
+		stream, err = cli.DialStream(ctx, target)
+	} else {
+		pinner, ok := cli.(exitPinner)
+		if !ok {
+			return nil, errors.New("tor provider: client does not support pinned-exit dials")
+		}
+		stream, err = pinner.DialStreamViaExit(ctx, exitDigest, target)
+	}
 	if err != nil {
 		return nil, fmt.Errorf("tor provider: dial %s: %w", target, err)
 	}
 	return streamConn{stream}, nil
+}
+
+// exitAddress reports the OR address of the relay named by exitDigest in the
+// live client's current exit roster. Per-relay outbounds expose it as their
+// Address so the engine can display, geolocate, and probe the real relay.
+func (p *Provider) exitAddress(exitDigest string) (string, error) {
+	p.mu.Lock()
+	cli := p.client
+	p.mu.Unlock()
+	lister, ok := cli.(exitLister)
+	if !ok {
+		return "", errors.New("tor provider: client has no exit roster")
+	}
+	for _, r := range lister.ExitInfos() {
+		if r.IDDigest == exitDigest {
+			return r.Address, nil
+		}
+	}
+	return "", fmt.Errorf("tor provider: exit %s is not in the current roster", exitDigest)
 }
 
 func parseConfig(cfg map[string]any) (providerConfig, error) {
@@ -398,14 +455,19 @@ func (p *Provider) Name() string { return "tor" }
 func (p *Provider) Watch() <-chan struct{} { return p.watchCh }
 
 // Outbounds returns the current outbound set: empty until the tor-go client
-// is connected, then a single outbound of the "tor" protocol, which dials
-// circuits in memory through this provider. A terminal bootstrap failure
+// is connected, then one general "tor" outbound (random exit per circuit)
+// PLUS one outbound per Exit-flagged relay in the client's directory — the
+// tor equivalent of the psiphon provider's per-server list — so the engine
+// (and the web UI) can show and pin the real relay roster. Per-exit outbounds
+// are named <id>-<nickname>-<digest-prefix> and pin the circuit's exit hop
+// to that relay via the "exit" config key. A terminal bootstrap failure
 // returns the error so the engine logs it (the existing pool, if any, is
 // kept).
 func (p *Provider) Outbounds(_ context.Context) ([]pub.OutboundConfig, error) {
 	p.mu.Lock()
 	ready := p.ready
 	err := p.startErr
+	cli := p.client
 	id := p.cfg.OutboundID
 	allowPrivate := p.cfg.AllowPrivateAddresses
 	p.mu.Unlock()
@@ -415,7 +477,8 @@ func (p *Provider) Outbounds(_ context.Context) ([]pub.OutboundConfig, error) {
 	if !ready {
 		return nil, nil
 	}
-	return []pub.OutboundConfig{
+
+	out := []pub.OutboundConfig{
 		{
 			ID:       id,
 			Protocol: "tor",
@@ -425,7 +488,29 @@ func (p *Provider) Outbounds(_ context.Context) ([]pub.OutboundConfig, error) {
 				"allow_private": allowPrivate,
 			},
 		},
-	}, nil
+	}
+	lister, ok := cli.(exitLister)
+	if !ok {
+		// The client predates the exit-roster surface; the general outbound
+		// still works. (Only the mock in tests takes this branch.)
+		return out, nil
+	}
+	for _, r := range lister.ExitInfos() {
+		exitID := id + "-" + r.Nickname + "-" + r.IDDigest[:12]
+		out = append(out, pub.OutboundConfig{
+			ID:       exitID,
+			Protocol: "tor",
+			Config: map[string]any{
+				"id":            exitID,
+				"tunnel":        id,
+				"allow_private": allowPrivate,
+				"exit":          r.IDDigest,
+				"exit_name":     r.Nickname,
+				"address":       r.Address,
+			},
+		})
+	}
+	return out, nil
 }
 
 // Close stops the tor-go client and waits for the goroutine to exit. The

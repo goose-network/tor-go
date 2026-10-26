@@ -4,20 +4,36 @@ import (
 	"context"
 	"errors"
 	"io"
+	"strings"
 	"testing"
 	"time"
 
 	pub "github.com/goose-network/goose-plugin-api"
+
+	"github.com/goose-network/tor-go/internal/torclient"
 )
 
 // fakeClient is a stand-in for the tor-go client used by provider tests that
 // exercise the dial path without a real Tor bootstrap. It satisfies the
-// surface the provider's dialStream uses.
+// surface the provider's dialStream uses; the exits field simulates the
+// per-exit roster surface (exitLister + exitPinner) when set.
 type fakeClient struct {
 	onDial func(target string) (io.ReadWriteCloser, error)
+	exits  []torclient.RouterInfo // when non-nil, the fake implements the roster + pin dials
+	lastTo string                // digest of the last pinned dial ("" when unpinned)
 }
 
 func (f *fakeClient) DialStream(ctx context.Context, target string) (io.ReadWriteCloser, error) {
+	if f.onDial == nil {
+		return nil, errors.New("fakeClient: no dial behavior configured")
+	}
+	return f.onDial(target)
+}
+
+func (f *fakeClient) ExitInfos() []torclient.RouterInfo { return f.exits }
+
+func (f *fakeClient) DialStreamViaExit(ctx context.Context, hexDigest, target string) (io.ReadWriteCloser, error) {
+	f.lastTo = hexDigest
 	if f.onDial == nil {
 		return nil, errors.New("fakeClient: no dial behavior configured")
 	}
@@ -330,5 +346,150 @@ func TestCloseStopsBootstrap(t *testing.T) {
 	// Close deregistered the live provider: dials now fail the lookup.
 	if _, ok := lookupLiveProvider("tor"); ok {
 		t.Fatal("default tunnel id should be gone after Close")
+	}
+}
+
+// TestOutboundsEmitPerExitRelays covers the per-server list form: once the
+// client is ready and reports an exit roster, Outbounds emits the general
+// outbound plus one per Exit-flagged relay, each carrying the digest that
+// pins the circuit's exit hop.
+func TestOutboundsEmitPerExitRelays(t *testing.T) {
+	roster := []torclient.RouterInfo{
+		{Nickname: "relayA", IDDigest: "aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa", Address: "1.2.3.4:9001", IsExit: true},
+		{Nickname: "relayB", IDDigest: "bbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbb", Address: "5.6.7.8:9002", IsExit: true},
+	}
+	p := &Provider{
+		cfg:     providerConfig{OutboundID: "tor-list"},
+		watchCh: make(chan struct{}, 1),
+		stopped: make(chan struct{}),
+		client:  &fakeClient{exits: roster},
+	}
+	p.mu.Lock()
+	p.ready = true
+	p.mu.Unlock()
+
+	out, err := p.Outbounds(context.Background())
+	if err != nil {
+		t.Fatalf("Outbounds: %v", err)
+	}
+	if len(out) != 3 {
+		t.Fatalf("got %d outbounds, want 3 (general + 2 exits): %+v", len(out), out)
+	}
+	if out[0].ID != "tor-list" {
+		t.Fatalf("out[0].ID = %q, want the general outbound first", out[0].ID)
+	}
+	if _, hasExit := out[0].Config["exit"]; hasExit {
+		t.Fatal("general outbound must not carry an exit pin")
+	}
+
+	// Per-exit entries: id is provider id + nickname + digest prefix, config
+	// carries the full digest + display fields.
+	for i, want := range []struct{ id, digest, name, addr string }{
+		{"tor-list-relayA-aaaaaaaaaaaa", roster[0].IDDigest, "relayA", "1.2.3.4:9001"},
+		{"tor-list-relayB-bbbbbbbbbbbb", roster[1].IDDigest, "relayB", "5.6.7.8:9002"},
+	} {
+		got := out[1+i]
+		if got.ID != want.id || got.Protocol != "tor" {
+			t.Fatalf("per-exit outbound %d = %q (%s), want %q", i, got.ID, got.Protocol, want.id)
+		}
+		if digest, _ := got.Config["exit"].(string); digest != want.digest {
+			t.Fatalf("outbound %s exit digest = %q, want %q", got.ID, digest, want.digest)
+		}
+		if name, _ := got.Config["exit_name"].(string); name != want.name {
+			t.Fatalf("outbound %s exit_name = %q, want %q", got.ID, name, want.name)
+		}
+		if addr, _ := got.Config["address"].(string); addr != want.addr {
+			t.Fatalf("outbound %s address = %q, want %q", got.ID, addr, want.addr)
+		}
+		if tunnel, _ := got.Config["tunnel"].(string); tunnel != "tor-list" {
+			t.Fatalf("outbound %s tunnel = %q, want tor-list (the general provider)", got.ID, tunnel)
+		}
+	}
+}
+
+// TestPerExitOutboundDialPinsExit verifies the per-exit dial path end to end
+// through the outbound factory: a dial on a per-relay outbound resolves the
+// live provider and reaches the client with that relay's digest, while the
+// general outbound dials unpinned. The per-exit outbound's Address() reports
+// the relay's OR address.
+func TestPerExitOutboundDialPinsExit(t *testing.T) {
+	digest := "cccccccccccccccccccccccccccccccccccccccc"
+	fc := &fakeClient{
+		onDial: func(target string) (io.ReadWriteCloser, error) { return echoRW{}, nil },
+		exits:  []torclient.RouterInfo{{Nickname: "relayC", IDDigest: digest, Address: "9.9.9.9:9003", IsExit: true}},
+	}
+	p := &Provider{
+		cfg:     providerConfig{OutboundID: "tor-pin"},
+		watchCh: make(chan struct{}, 1),
+		stopped: make(chan struct{}),
+		client:  fc,
+	}
+	p.mu.Lock()
+	p.ready = true
+	p.mu.Unlock()
+	registerLiveProvider(p)
+	defer unregisterLiveProvider(p)
+
+	pinned, err := New(map[string]any{
+		"id":        "tor-pin-relayC-cccccccccccc",
+		"tunnel":    "tor-pin",
+		"exit":      digest,
+		"exit_name": "relayC",
+	})
+	if err != nil {
+		t.Fatalf("New(per-exit): %v", err)
+	}
+	if addr := pinned.Address(); addr != "9.9.9.9:9003" {
+		t.Fatalf("per-exit Address() = %q, want the relay's OR address", addr)
+	}
+	if _, err := pinned.DialContext(context.Background(), pub.NetworkTCP, "example.com:80"); err != nil {
+		t.Fatalf("pinned dial: %v", err)
+	}
+	if fc.lastTo != digest {
+		t.Fatalf("client saw pin %q, want %q", fc.lastTo, digest)
+	}
+
+	general, err := New(map[string]any{"id": "tor-pin", "tunnel": "tor-pin"})
+	if err != nil {
+		t.Fatalf("New(general): %v", err)
+	}
+	fc.lastTo = "sentinel"
+	if _, err := general.DialContext(context.Background(), pub.NetworkTCP, "example.com:80"); err != nil {
+		t.Fatalf("general dial: %v", err)
+	}
+	if fc.lastTo != "sentinel" {
+		t.Fatalf("general dial reached DialStreamViaExit (pin %q), want the unpinned path", fc.lastTo)
+	}
+}
+
+// TestPerExitDialWithoutPinnerSupport verifies a client that lacks the
+// pin surface (an embedder predating it) fails the pinned dial fast with a
+// diagnosable error while general dials still work.
+func TestPerExitDialWithoutPinnerSupport(t *testing.T) {
+	bare := struct{ streamDialer }{streamDialer: &fakeClient{
+		onDial: func(target string) (io.ReadWriteCloser, error) { return echoRW{}, nil },
+	}}
+	p := &Provider{
+		cfg:     providerConfig{OutboundID: "tor-bare"},
+		watchCh: make(chan struct{}, 1),
+		stopped: make(chan struct{}),
+		client:  bare,
+	}
+	registerLiveProvider(p)
+	defer unregisterLiveProvider(p)
+
+	pinned, err := New(map[string]any{"id": "tor-bare-x", "tunnel": "tor-bare", "exit": strings.Repeat("d", 40)})
+	if err != nil {
+		t.Fatalf("New: %v", err)
+	}
+	if _, err := pinned.DialContext(context.Background(), pub.NetworkTCP, "example.com:80"); err == nil {
+		t.Fatal("pinned dial on a client without pin support should fail")
+	}
+	general, err := New(map[string]any{"id": "tor-bare", "tunnel": "tor-bare"})
+	if err != nil {
+		t.Fatalf("New(general): %v", err)
+	}
+	if _, err := general.DialContext(context.Background(), pub.NetworkTCP, "example.com:80"); err != nil {
+		t.Fatalf("general dial must still work: %v", err)
 	}
 }
