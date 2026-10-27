@@ -5,10 +5,12 @@ import (
 	"crypto/rand"
 	"crypto/rsa"
 	"crypto/sha1"
+	"crypto/sha256"
 	"crypto/x509"
 	"encoding/base64"
 	"encoding/hex"
 	"encoding/pem"
+	"math/big"
 	"strings"
 	"testing"
 )
@@ -33,6 +35,28 @@ func base64Wrap(data []byte) string {
 	return b.String()
 }
 
+// signRawRSA signs a digest the way Tor's crypto_pk_private_sign does:
+// a PKCS#1 v1.5 type-1 padded block over the bare digest (no DigestInfo),
+// inverted by rsaVerifyRawDigest.
+func signRawRSA(t *testing.T, priv *rsa.PrivateKey, digest []byte) []byte {
+	t.Helper()
+	k := priv.Size()
+	em := make([]byte, k)
+	em[0], em[1] = 0x00, 0x01
+	ps := k - len(digest) - 3
+	if ps < 8 {
+		t.Fatalf("digest too long for key")
+	}
+	for i := 0; i < ps; i++ {
+		em[2+i] = 0xff
+	}
+	copy(em[2+ps+1:], digest)
+	m := new(big.Int).Exp(new(big.Int).SetBytes(em), priv.D, priv.N)
+	out := make([]byte, k)
+	m.FillBytes(out)
+	return out
+}
+
 // mintAuthority generates an RSA identity key and a separate RSA signing key,
 // builds a dir-key-certificate-version 3 cert binding them, self-signs it with
 // the identity key, and returns the cert text plus the parsed cert. This
@@ -54,8 +78,8 @@ func mintAuthority(t *testing.T) (certText string, signingKey *rsa.PrivateKey) {
 	var b strings.Builder
 	b.WriteString("dir-key-certificate-version 3\n")
 	b.WriteString("fingerprint ")
-	idDER, _ := x509.MarshalPKIXPublicKey(&idKey.PublicKey)
-	fp := sha1.Sum(idDER)
+	// Tor fingerprints are SHA-1 over the PKCS#1 RSAPublicKey DER.
+	fp := sha1.Sum(x509.MarshalPKCS1PublicKey(&idKey.PublicKey))
 	b.WriteString(strings.ToUpper(hex.EncodeToString(fp[:])))
 	b.WriteString("\n")
 	b.WriteString("dir-key-expires 2030-01-01 00:00:00\n")
@@ -65,10 +89,7 @@ func mintAuthority(t *testing.T) (certText string, signingKey *rsa.PrivateKey) {
 	signedPortion := b.String()
 
 	digest := sha1.Sum([]byte(signedPortion))
-	sig, err := rsa.SignPKCS1v15(rand.Reader, idKey, crypto.SHA1, digest[:])
-	if err != nil {
-		t.Fatal(err)
-	}
+	sig := signRawRSA(t, idKey, digest[:])
 	b.WriteString("-----BEGIN SIGNATURE-----\n")
 	b.WriteString(base64Wrap(sig))
 	b.WriteString("-----END SIGNATURE-----\n")
@@ -86,29 +107,30 @@ func pemRSAPublicKey(pub *rsa.PublicKey) string {
 // signConsensus signs the consensus's signed portion with the given signing
 // key and appends a directory-signature block for the authority. The signed
 // portion runs from "network-status-version" up to and including the
-// "directory-signature " keyword (with its trailing space), so we append the
-// signature header line first, compute the digest over that portion, then
-// append the base64 signature block.
-func signConsensus(t *testing.T, consensus string, idDigest [20]byte, signKey *rsa.PrivateKey) string {
+// "directory-signature " keyword (with its trailing space) — identical for
+// the sha1 and sha256 forms — so we append the signature header line first,
+// compute the digest over that portion, then append the base64 signature
+// block. alg is "sha1" (3-field line) or "sha256" (4-field line).
+func signConsensus(t *testing.T, consensus string, idDigest [20]byte, signKey *rsa.PrivateKey, alg string) string {
 	t.Helper()
-	skDER, _ := x509.MarshalPKIXPublicKey(&signKey.PublicKey)
-	skDigest := sha1.Sum(skDER)
+	skDigest := sha1.Sum(x509.MarshalPKCS1PublicKey(&signKey.PublicKey))
 	var b strings.Builder
 	b.WriteString(consensus)
-	b.WriteString("directory-signature ")
+	if alg == "sha256" {
+		b.WriteString("directory-signature sha256 ")
+	} else {
+		b.WriteString("directory-signature ")
+	}
 	b.WriteString(strings.ToUpper(hex.EncodeToString(idDigest[:])))
 	b.WriteString(" ")
 	b.WriteString(strings.ToUpper(hex.EncodeToString(skDigest[:])))
 	b.WriteString("\n")
 	withHeader := b.String()
-	digest, err := ConsensusSignedDigest([]byte(withHeader))
+	digest, err := ConsensusSignedDigest([]byte(withHeader), alg)
 	if err != nil {
 		t.Fatalf("ConsensusSignedDigest: %v", err)
 	}
-	sig, err := rsa.SignPKCS1v15(rand.Reader, signKey, crypto.SHA1, digest)
-	if err != nil {
-		t.Fatal(err)
-	}
+	sig := signRawRSA(t, signKey, digest)
 	b.WriteString("-----BEGIN SIGNATURE-----\n")
 	b.WriteString(base64Wrap(sig))
 	b.WriteString("-----END SIGNATURE-----\n")
@@ -138,22 +160,42 @@ func minimalConsensus() string {
 func TestConsensusSignedDigestBoundaries(t *testing.T) {
 	cons := minimalConsensus()
 	// Append a signature line so the signed portion has an end marker.
-	cons += "directory-signature 0123456789ABCDEF0123456789ABCDEF01234567 FEDCBA9876543210FEDCBA9876543210FEDCBA98\n"
-	digest, err := ConsensusSignedDigest([]byte(cons))
-	if err != nil {
-		t.Fatal(err)
+	cons += "directory-signature sha256 0123456789ABCDEF0123456789ABCDEF01234567 FEDCBA9876543210FEDCBA9876543210FEDCBA98\n"
+	for _, alg := range []string{"sha1", "sha256"} {
+		digest, err := ConsensusSignedDigest([]byte(cons), alg)
+		if err != nil {
+			t.Fatalf("ConsensusSignedDigest(%s): %v", alg, err)
+		}
+		wantLen := 20
+		if alg == "sha256" {
+			wantLen = 32
+		}
+		if len(digest) != wantLen {
+			t.Fatalf("%s digest len %d, want %d", alg, len(digest), wantLen)
+		}
 	}
-	if len(digest) != 20 {
-		t.Fatalf("digest len %d, want 20", len(digest))
-	}
-	// The signed portion must end at "directory-signature " (with the space).
-	// Recompute it manually to cross-check.
+	// The signed portion must end at "directory-signature " (with the space)
+	// for BOTH algorithms — only the hash differs. Recompute it manually to
+	// cross-check.
 	start := strings.Index(cons, "network-status-version")
 	end := strings.Index(cons, "\ndirectory-signature") + len("\ndirectory-signature")
 	space := strings.IndexByte(cons[end:], ' ') + end + 1
-	want := sha1.Sum([]byte(cons[start:space]))
-	if string(digest) != string(want[:]) {
-		t.Fatalf("digest mismatch: got %x want %x", digest, want)
+	signedPortion := cons[start:space]
+	want1 := sha1.Sum([]byte(signedPortion))
+	got1, err := ConsensusSignedDigest([]byte(cons), "sha1")
+	if err != nil {
+		t.Fatal(err)
+	}
+	if string(got1) != string(want1[:]) {
+		t.Fatalf("sha1 digest mismatch: got %x want %x", got1, want1)
+	}
+	want2 := sha256.Sum256([]byte(signedPortion))
+	got2, err := ConsensusSignedDigest([]byte(cons), "sha256")
+	if err != nil {
+		t.Fatal(err)
+	}
+	if string(got2) != string(want2[:]) {
+		t.Fatalf("sha256 digest mismatch: got %x want %x", got2, want2)
 	}
 }
 
@@ -243,7 +285,7 @@ func TestVerifyConsensusSignaturesGood(t *testing.T) {
 		idHex := strings.ToUpper(hex.EncodeToString(cert.IdentityDigest[:]))
 		TrustedV3AuthorityDigests[idHex] = true
 		certs[strings.ToLower(idHex)] = cert
-		cons = signConsensus(t, cons, cert.IdentityDigest, signKey)
+		cons = signConsensus(t, cons, cert.IdentityDigest, signKey, "sha1")
 	}
 	// With 5 trusted authorities and 5 good signatures, quorum = 5/2+1 = 3.
 	good, err := VerifyConsensusSignatures([]byte(cons), certs)
@@ -255,6 +297,104 @@ func TestVerifyConsensusSignaturesGood(t *testing.T) {
 	}
 	if good < ConsensusQuorum() {
 		t.Fatalf("quorum not met: %d < %d", good, ConsensusQuorum())
+	}
+}
+
+// mintSignedConsensus builds n authorities, trusts them all, and signs a
+// consensus once per authority with the given algorithms (cycled). Returns
+// the consensus document and the certs map, ready for
+// VerifyConsensusSignatures.
+func mintSignedConsensus(t *testing.T, n int, algs []string) (string, map[string]*AuthorityCert) {
+	t.Helper()
+	origTrusted := TrustedV3AuthorityDigests
+	t.Cleanup(func() { TrustedV3AuthorityDigests = origTrusted })
+	TrustedV3AuthorityDigests = map[string]bool{}
+	certs := map[string]*AuthorityCert{}
+	cons := minimalConsensus()
+	for i := 0; i < n; i++ {
+		certText, signKey := mintAuthority(t)
+		cert, err := ParseAuthorityCert([]byte(certText))
+		if err != nil {
+			t.Fatal(err)
+		}
+		idHex := strings.ToUpper(hex.EncodeToString(cert.IdentityDigest[:]))
+		TrustedV3AuthorityDigests[idHex] = true
+		certs[strings.ToLower(idHex)] = cert
+		cons = signConsensus(t, cons, cert.IdentityDigest, signKey, algs[i%len(algs)])
+	}
+	return cons, certs
+}
+
+// TestVerifyConsensusSignaturesSHA256Only is the live-network regression:
+// consensus method 12+ consensuses carry only "directory-signature sha256"
+// lines. The verifier used to skip non-sha1 lines entirely and count 0 good
+// signatures against a quorum of 5.
+func TestVerifyConsensusSignaturesSHA256Only(t *testing.T) {
+	cons, certs := mintSignedConsensus(t, 5, []string{"sha256"})
+	good, err := VerifyConsensusSignatures([]byte(cons), certs)
+	if err != nil {
+		t.Fatalf("VerifyConsensusSignatures: %v", err)
+	}
+	if good != 5 {
+		t.Fatalf("good = %d, want 5 (all sha256)", good)
+	}
+}
+
+// Mixed sha1 and sha256 signatures must each count toward the quorum.
+func TestVerifyConsensusSignaturesMixed(t *testing.T) {
+	cons, certs := mintSignedConsensus(t, 6, []string{"sha1", "sha256"})
+	good, err := VerifyConsensusSignatures([]byte(cons), certs)
+	if err != nil {
+		t.Fatalf("VerifyConsensusSignatures: %v", err)
+	}
+	if good != 6 {
+		t.Fatalf("good = %d, want 6 (3 sha1 + 3 sha256)", good)
+	}
+}
+
+// A DigestInfo-style signature (rsa.SignPKCS1v15) must be REJECTED: Tor signs
+// the bare digest, so accepting DigestInfo blocks would validate signatures
+// the network never produced.
+func TestVerifyConsensusSignaturesRejectsDigestInfo(t *testing.T) {
+	origTrusted := TrustedV3AuthorityDigests
+	t.Cleanup(func() { TrustedV3AuthorityDigests = origTrusted })
+
+	certText, signKey := mintAuthority(t)
+	cert, err := ParseAuthorityCert([]byte(certText))
+	if err != nil {
+		t.Fatal(err)
+	}
+	idHex := strings.ToUpper(hex.EncodeToString(cert.IdentityDigest[:]))
+	TrustedV3AuthorityDigests = map[string]bool{idHex: true}
+	certs := map[string]*AuthorityCert{strings.ToLower(idHex): cert}
+
+	// Build a 4-field sha256 header, then sign the digest DigestInfo-style.
+	skDigest := sha1.Sum(x509.MarshalPKCS1PublicKey(&signKey.PublicKey))
+	var b strings.Builder
+	b.WriteString(minimalConsensus())
+	b.WriteString("directory-signature sha256 ")
+	b.WriteString(idHex)
+	b.WriteString(" ")
+	b.WriteString(strings.ToUpper(hex.EncodeToString(skDigest[:])))
+	b.WriteString("\n")
+	digest, err := ConsensusSignedDigest([]byte(b.String()), "sha256")
+	if err != nil {
+		t.Fatal(err)
+	}
+	sig, err := rsa.SignPKCS1v15(rand.Reader, signKey, crypto.SHA256, digest)
+	if err != nil {
+		t.Fatal(err)
+	}
+	b.WriteString("-----BEGIN SIGNATURE-----\n")
+	b.WriteString(base64Wrap(sig))
+	b.WriteString("-----END SIGNATURE-----\n")
+
+	good, err := VerifyConsensusSignatures([]byte(b.String()), certs)
+	if err != nil {
+		t.Fatalf("VerifyConsensusSignatures: %v", err)
+	}
+	if good != 0 {
+		t.Fatalf("DigestInfo-style signature accepted: good = %d, want 0", good)
 	}
 }
 
@@ -275,7 +415,7 @@ func TestVerifyConsensusSignaturesRejectsTampered(t *testing.T) {
 		idHex := strings.ToUpper(hex.EncodeToString(cert.IdentityDigest[:]))
 		TrustedV3AuthorityDigests[idHex] = true
 		certs[strings.ToLower(idHex)] = cert
-		cons = signConsensus(t, cons, cert.IdentityDigest, signKey)
+		cons = signConsensus(t, cons, cert.IdentityDigest, signKey, "sha1")
 	}
 	// Tamper with the consensus body (after the signatures are appended, the
 	// signed portion is unchanged, so the signatures no longer match the
@@ -305,7 +445,7 @@ func TestVerifyConsensusSignaturesIgnoresUnrecognized(t *testing.T) {
 	certs := map[string]*AuthorityCert{
 		strings.ToLower(hex.EncodeToString(cert.IdentityDigest[:])): cert,
 	}
-	cons := signConsensus(t, minimalConsensus(), cert.IdentityDigest, signKey)
+	cons := signConsensus(t, minimalConsensus(), cert.IdentityDigest, signKey, "sha1")
 	good, _ := VerifyConsensusSignatures([]byte(cons), certs)
 	if good != 0 {
 		t.Fatalf("unrecognized authority: good = %d, want 0", good)

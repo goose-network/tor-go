@@ -1,13 +1,23 @@
 // consensussig.go implements verification of v3 consensus signatures.
 //
 // A Tor v3 network-status consensus is signed by a majority of the trusted
-// directory authorities. Each authority signs the SHA-1 digest of the
-// consensus's "signed portion" (everything from "network-status-version" up
-// to and including the "directory-signature " keyword) with its RSA signing
-// key. The signing key is itself certified by the authority's long-term RSA
-// identity key in an authority certificate, which the client fetches
-// separately. A consensus is accepted once at least half+1 of the recognized
-// v3 authorities have produced valid signatures.
+// directory authorities. Each authority signs the digest of the consensus's
+// "signed portion" — everything from "network-status-version" up to and
+// including the "directory-signature " keyword — with its RSA signing key,
+// over SHA-1 for the legacy signature form or SHA-256 for the
+// "directory-signature sha256" form (consensus method 12+; the live network
+// now signs sha256-only). The signature is a raw RSA public-key operation
+// over the bare digest (crypto_pk_private_sign = RSA_private_encrypt with
+// PKCS1 padding), NOT a DigestInfo scheme — rsa.VerifyPKCS1v15 cannot
+// verify these. The signing key is itself certified by the authority's
+// long-term RSA identity key in an authority certificate, which the client
+// fetches separately. A consensus is accepted once at least half+1 of the
+// recognized v3 authorities have produced valid signatures.
+//
+// All three properties — the signed-portion span, the raw-digest RSA
+// padding, and key digests being SHA-1 over the PKCS#1 RSAPublicKey DER —
+// were validated against a live consensus-method-36 document and its
+// authority certs (2026-10).
 //
 // This mirrors networkstatus_check_consensus_signature /
 // networkstatus_check_document_signature (networkstatus.c),
@@ -24,15 +34,17 @@ package directory
 import (
 	"bufio"
 	"bytes"
-	"crypto"
 	"crypto/rsa"
 	"crypto/sha1"
+	"crypto/sha256"
+	"crypto/subtle"
 	"crypto/x509"
 	"encoding/base64"
 	"encoding/hex"
 	"encoding/pem"
 	"errors"
 	"fmt"
+	"math/big"
 	"strings"
 )
 
@@ -66,11 +78,11 @@ func ConsensusQuorum() int {
 // (dir-key-certificate-version 3). It binds an authority's RSA signing key
 // (used to sign consensuses) to its long-term RSA identity key.
 type AuthorityCert struct {
-	// IdentityDigest is the SHA-1 of the identity key's SPKI DER (the
-	// authority's "v3ident").
+	// IdentityDigest is the SHA-1 of the identity key's PKCS#1
+	// RSAPublicKey DER (the authority's "v3ident" / fingerprint).
 	IdentityDigest [20]byte
-	// SigningKeyDigest is the SHA-1 of the signing key's SPKI DER; this must
-	// match the sk_hexdigest in a consensus signature line.
+	// SigningKeyDigest is the SHA-1 of the signing key's PKCS#1 DER; this
+	// must match the sk_hexdigest in a consensus signature line.
 	SigningKeyDigest [20]byte
 	// SigningKey is the RSA public key that signs consensuses.
 	SigningKey *rsa.PublicKey
@@ -176,12 +188,15 @@ func ParseConsensusSignatures(consensus []byte) ([]ConsensusSignature, error) {
 	return sigs, nil
 }
 
-// ConsensusSignedDigest computes the SHA-1 digest of the consensus's signed
+// ConsensusSignedDigest computes the digest of the consensus's signed
 // portion: from the first "network-status-version" at the start of a line up
 // to and including the first "directory-signature " keyword (with its
-// trailing space). This is the digest each authority signs. Mirrors
-// router_get_networkstatus_v3_hashes (end_c=' ').
-func ConsensusSignedDigest(consensus []byte) ([]byte, error) {
+// trailing space). The algorithm is "sha1" (the legacy 3-field
+// directory-signature form) or "sha256" (the 4-field form); the signed
+// portion is identical for both — only the hash differs. Mirrors
+// router_get_networkstatus_v3_hashes (end_c=' '), validated against a live
+// consensus-method-36 document whose authorities all sign sha256.
+func ConsensusSignedDigest(consensus []byte, algorithm string) ([]byte, error) {
 	startStr := "network-status-version"
 	endStr := "\ndirectory-signature"
 	start := bytes.Index(consensus, []byte(startStr))
@@ -204,8 +219,16 @@ func ConsensusSignedDigest(consensus []byte) ([]byte, error) {
 		return nil, errors.New("consensus: no space after directory-signature")
 	}
 	signedPortion := consensus[start : after+spaceIdx+1]
-	h := sha1.Sum(signedPortion)
-	return h[:], nil
+	switch strings.ToLower(algorithm) {
+	case "sha1":
+		h := sha1.Sum(signedPortion)
+		return h[:], nil
+	case "sha256":
+		h := sha256.Sum256(signedPortion)
+		return h[:], nil
+	default:
+		return nil, fmt.Errorf("consensus: unsupported digest algorithm %q", algorithm)
+	}
 }
 
 // VerifyConsensusSignatures verifies the signatures on a consensus document
@@ -219,27 +242,24 @@ func ConsensusSignedDigest(consensus []byte) ([]byte, error) {
 //  2. A cert is present for that identity, and the cert's signing-key digest
 //     matches the signature's signing-key digest.
 //  3. RSA-verifying the signature with the cert's signing key yields the
-//     consensus signed digest (PKCS#1 v1.5 over the raw SHA-1 digest — Tor
-//     uses crypto_pk_public_checksig, which is raw RSA public-key operation
-//     on the digest, equivalent to PKCS1v15 with an unpadded digest).
+//     consensus signed digest for the signature's algorithm ("sha1" or
+//     "sha256"; both cover the same signed portion) — a raw RSA public-key
+//     operation per crypto_pk_public_checksig, not a DigestInfo scheme.
 //
 // The consensus is accepted if the good count is at least ConsensusQuorum().
+// Since consensus method 12+ the live network signs consensuses sha256-only,
+// so without the sha256 path every live consensus would count 0 signatures.
 func VerifyConsensusSignatures(consensus []byte, certs map[string]*AuthorityCert) (int, error) {
-	digest, err := ConsensusSignedDigest(consensus)
-	if err != nil {
-		return 0, fmt.Errorf("consensus: compute signed digest: %w", err)
-	}
 	sigs, err := ParseConsensusSignatures(consensus)
 	if err != nil {
 		return 0, fmt.Errorf("consensus: parse signatures: %w", err)
 	}
+	digests := map[string][]byte{} // algorithm -> digest, computed lazily
 	good := 0
 	for _, sig := range sigs {
-		if sig.Algorithm != "sha1" {
-			// We only verify SHA-1 signatures (the default). Other algorithms
-			// (e.g. sha256) are skipped; they would need a SHA-256 signed
-			// digest, which we don't compute here.
-			continue
+		alg := strings.ToLower(sig.Algorithm)
+		if alg != "sha1" && alg != "sha256" {
+			continue // unknown digest algorithm
 		}
 		idLower := strings.ToLower(sig.IdentityDigest)
 		if !TrustedV3AuthorityDigests[strings.ToUpper(sig.IdentityDigest)] {
@@ -254,7 +274,15 @@ func VerifyConsensusSignatures(consensus []byte, certs map[string]*AuthorityCert
 		if strings.ToUpper(skHex) != sig.SigningKeyDigest {
 			continue
 		}
-		if err := rsaVerifyConsensusSig(cert.SigningKey, digest, sig.Signature); err != nil {
+		digest, ok := digests[alg]
+		if !ok {
+			digest, err = ConsensusSignedDigest(consensus, alg)
+			if err != nil {
+				return 0, fmt.Errorf("consensus: compute signed digest: %w", err)
+			}
+			digests[alg] = digest
+		}
+		if err := rsaVerifyRawDigest(cert.SigningKey, digest, sig.Signature); err != nil {
 			continue // bad signature
 		}
 		good++
@@ -262,20 +290,43 @@ func VerifyConsensusSignatures(consensus []byte, certs map[string]*AuthorityCert
 	return good, nil
 }
 
-// rsaVerifyConsensusSig verifies a consensus signature. Tor uses
-// crypto_pk_public_checksig, which performs a raw RSA public-key operation
-// (RSAES-PKCS1-v1_5 decryption) and compares the recovered plaintext to the
-// digest. For a SHA-1-signed consensus, the signed value embedded in the
-// PKCS#1 v1.5 padding is the 20-byte SHA-1 digest itself, so
-// rsa.VerifyPKCS1v15 with crypto.SHA1 over the digest is equivalent.
-func rsaVerifyConsensusSig(pub *rsa.PublicKey, digest, sig []byte) error {
+// rsaVerifyRawDigest verifies a raw-digest RSA signature the way Tor actually
+// signs: crypto_pk_private_sign is RSA_private_encrypt with PKCS1_PADDING (a
+// "type 1" encryption-style block), so the recovered plaintext is the bare
+// digest, not a DigestInfo-wrapped one. rsa.VerifyPKCS1v15 cannot verify such
+// signatures — it only accepts DigestInfo-encapsulated hashes. This mirrors
+// crypto_pk_public_checksig: sig^e mod n, strip the 0x00 0x01 0xFF… 0x00
+// padding, and require the remainder to equal the digest exactly.
+func rsaVerifyRawDigest(pub *rsa.PublicKey, digest, sig []byte) error {
 	if pub == nil {
-		return errors.New("nil signing key")
+		return errors.New("nil key")
 	}
-	if len(digest) != 20 {
-		return fmt.Errorf("unexpected digest length %d", len(digest))
+	k := pub.Size()
+	if len(sig) != k {
+		return fmt.Errorf("signature length %d, want key size %d", len(sig), k)
 	}
-	return rsa.VerifyPKCS1v15(pub, crypto.SHA1, digest, sig)
+	c := new(big.Int).SetBytes(sig)
+	if c.Cmp(pub.N) >= 0 {
+		return errors.New("signature out of range")
+	}
+	m := new(big.Int).Exp(c, big.NewInt(int64(pub.E)), pub.N)
+	em := make([]byte, k)
+	m.FillBytes(em)
+	// EM = 0x00 0x01 PS(0xFF…) 0x00 <digest>
+	if em[0] != 0x00 || em[1] != 0x01 {
+		return errors.New("bad PKCS#1 v1.5 header")
+	}
+	i := 2
+	for i < len(em) && em[i] == 0xff {
+		i++
+	}
+	if i == len(em) || em[i] != 0x00 {
+		return errors.New("bad PKCS#1 v1.5 padding separator")
+	}
+	if subtle.ConstantTimeCompare(em[i+1:], digest) != 1 {
+		return errors.New("digest mismatch")
+	}
+	return nil
 }
 
 // ParseAuthorityCert parses a dir-key-certificate-version 3 authority
@@ -333,7 +384,7 @@ func ParseAuthorityCert(text []byte) (*AuthorityCert, error) {
 	if sigBlock == nil {
 		return nil, errors.New("authcert: missing signature")
 	}
-	if err := rsa.VerifyPKCS1v15(identityKey, crypto.SHA1, certDigest[:], sigBlock); err != nil {
+	if err := rsaVerifyRawDigest(identityKey, certDigest[:], sigBlock); err != nil {
 		return nil, fmt.Errorf("authcert: self-signature invalid: %w", err)
 	}
 
@@ -341,15 +392,12 @@ func ParseAuthorityCert(text []byte) (*AuthorityCert, error) {
 		SigningKey:  signingKey,
 		IdentityKey: identityKey,
 	}
-	idDER, err := x509.MarshalPKIXPublicKey(identityKey)
-	if err != nil {
-		return nil, fmt.Errorf("authcert: marshal identity key: %w", err)
-	}
+	// Tor key digests/fingerprints are SHA-1 over the PKCS#1 RSAPublicKey
+	// DER, not the SPKI wrapper — validated against a live authority cert
+	// (fingerprint line and consensus signature lines both match this form).
+	idDER := x509.MarshalPKCS1PublicKey(identityKey)
 	cert.IdentityDigest = sha1.Sum(idDER)
-	skDER, err := x509.MarshalPKIXPublicKey(signingKey)
-	if err != nil {
-		return nil, fmt.Errorf("authcert: marshal signing key: %w", err)
-	}
+	skDER := x509.MarshalPKCS1PublicKey(signingKey)
 	cert.SigningKeyDigest = sha1.Sum(skDER)
 	return cert, nil
 }

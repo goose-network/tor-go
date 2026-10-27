@@ -258,10 +258,25 @@ func FetchWithMeta(ctx context.Context, opts FetchOptions) (map[string]*Router, 
 		}
 	}
 
+	// The dirport serves batched microdescriptors
+	// (/tor/micro/d/<d1>-<d2>-...; dircache.c splits on '-'), mirroring the C
+	// client, which joins digests per request instead of issuing thousands of
+	// round trips: a live consensus references ~7000 relays. Batches of 96
+	// (a ~4KB URL, well within the dirport's limits) were verified to return
+	// in full from the live authorities.
+	const microdescBatch = 96
 	var mdBuf strings.Builder
 	fetched := 0
-	for _, j := range jobs {
-		body, err := getWith(ctx, client, mdSource.MicrodescURL(j.b64))
+	for i := 0; i < len(jobs); i += microdescBatch {
+		end := i + microdescBatch
+		if end > len(jobs) {
+			end = len(jobs)
+		}
+		tokens := make([]string, 0, end-i)
+		for _, j := range jobs[i:end] {
+			tokens = append(tokens, j.b64)
+		}
+		body, err := getWith(ctx, client, mdSource.MicrodescURL(strings.Join(tokens, "-")))
 		if err != nil {
 			continue
 		}
