@@ -714,6 +714,13 @@ func (c *Client) directory() map[string]*directory.Router {
 	return c.dir
 }
 
+// RouterCount reports how many relays the current directory snapshot holds —
+// a cheap gauge for embedder observability (directory size at bootstrap and
+// after each consensus refresh).
+func (c *Client) RouterCount() int {
+	return len(c.directory())
+}
+
 // streamWrap wraps a circuit Stream so that closing the stream also closes
 // the (per-stream) circuit.
 type streamWrap struct {

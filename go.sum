@@ -1,5 +1,5 @@
-github.com/goose-network/goose-plugin-api v0.0.0-20261026123131-fb552d7d52b0 h1:8JM+933Fi5mocPxB8+PBBrISsUuQ8ipWdQ8R5ZHn9oY=
-github.com/goose-network/goose-plugin-api v0.0.0-20261026123131-fb552d7d52b0/go.mod h1:EYQF1WhEU/JhxP3SkSSjAWLBlnazvrj0Ex1EL4G3oHY=
+github.com/goose-network/goose-plugin-api v0.0.0-20261026144344-7d923b10a2d5 h1:CocrKEbeR63AX+Walg8olrNWfCpYlf3Jv14odXVDPLs=
+github.com/goose-network/goose-plugin-api v0.0.0-20261026144344-7d923b10a2d5/go.mod h1:EYQF1WhEU/JhxP3SkSSjAWLBlnazvrj0Ex1EL4G3oHY=
 golang.org/x/crypto v0.57.0 h1:3ZVCjf8Ggz7zneR/EHRVx68Ctf+2pmIMP2UFhh9cC6M=
 golang.org/x/crypto v0.57.0/go.mod h1:Fdz0i5U6CoizGwLda9DttjSk6qlZo25zYNtR+ycvuZA=
 golang.org/x/sys v0.48.0 h1:bbX/i/6MgT9BVLM9RT1thmxL04yeTAhbEz4SyadbXoo=

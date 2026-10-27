@@ -10,6 +10,8 @@ import (
 
 	pub "github.com/goose-network/goose-plugin-api"
 
+	"github.com/goose-network/tor-go/internal/directory"
+	"github.com/goose-network/tor-go/internal/link"
 	"github.com/goose-network/tor-go/internal/torclient"
 )
 
@@ -18,9 +20,12 @@ import (
 // surface the provider's dialStream uses; the exits field simulates the
 // per-exit roster surface (exitLister + exitPinner) when set.
 type fakeClient struct {
-	onDial func(target string) (io.ReadWriteCloser, error)
-	exits  []torclient.RouterInfo // when non-nil, the fake implements the roster + pin dials
-	lastTo string                // digest of the last pinned dial ("" when unpinned)
+	onDial      func(target string) (io.ReadWriteCloser, error)
+	exits       []torclient.RouterInfo // when non-nil, the fake implements the roster + pin dials
+	connected   bool
+	guard       *directory.Router
+	routerCount int
+	lastTo      string // digest of the last pinned dial ("" when unpinned)
 }
 
 func (f *fakeClient) DialStream(ctx context.Context, target string) (io.ReadWriteCloser, error) {
@@ -492,4 +497,158 @@ func TestPerExitDialWithoutPinnerSupport(t *testing.T) {
 	if _, err := general.DialContext(context.Background(), pub.NetworkTCP, "example.com:80"); err != nil {
 		t.Fatalf("general dial must still work: %v", err)
 	}
+}
+
+// fakeClient's statusSource surface for Status tests: zero values report
+// "not connected" and no guard, matching a client that is still booting.
+func (f *fakeClient) Connected() bool          { return f.connected }
+func (f *fakeClient) Guard() *directory.Router { return f.guard }
+func (f *fakeClient) RouterCount() int         { return f.routerCount }
+
+// statusFixture builds a Provider in a given observability state the way the
+// lifecycle code would have left it.
+func statusFixture(mutate func(p *Provider)) *Provider {
+	p := &Provider{
+		cfg:     providerConfig{OutboundID: "tor", VerifySignatures: &[]bool{true}[0]},
+		watchCh: make(chan struct{}, 1),
+		stopped: make(chan struct{}),
+	}
+	if mutate != nil {
+		mutate(p)
+	}
+	return p
+}
+
+// TestStatusReporting walks the state machine Status() exposes: a fresh
+// provider reports the bootstrap phase; a failed attempt adds the failure
+// and the retry tick; connected adds guard facts; terminal error and Close
+// take precedence. All states must be cheap field reads with no panic,
+// including on a zero-value config (VerifySignatures nil).
+func TestStatusReporting(t *testing.T) {
+	// Bootstrapping: attempt underway, progress word as the message.
+	st := statusFixture(func(p *Provider) { p.phase = "fetching directory" }).Status()
+	if st.State != "bootstrapping" || st.Message != "fetching directory" {
+		t.Fatalf("bootstrapping: state=%q message=%q", st.State, st.Message)
+	}
+	if st.Details["verify_signatures"] != true {
+		t.Fatalf("verify_signatures default: %v", st.Details["verify_signatures"])
+	}
+
+	// Retrying: last failure as the message, with the retry tick.
+	retryAt := time.Now().Add(30 * time.Second)
+	st = statusFixture(func(p *Provider) {
+		p.lastBootErr = errors.New("fetch directory: no route")
+		p.attempts = 2
+		p.nextRetry = retryAt
+	}).Status()
+	if st.State != "retrying" || st.Message != "fetch directory: no route" {
+		t.Fatalf("retrying: state=%q message=%q", st.State, st.Message)
+	}
+	if st.Details["attempts"] != 2 {
+		t.Fatalf("attempts: %v", st.Details["attempts"])
+	}
+	if _, ok := st.Details["next_retry_at"]; !ok {
+		t.Fatal("retrying state must report next_retry_at")
+	}
+
+	// Running: guard facts from the live client surface.
+	connected := &fakeClient{
+		connected:   true,
+		routerCount: 9182,
+		guard: &directory.Router{RouterIdentity: link.RouterIdentity{
+			Nickname: "moria1",
+			Address:  "128.31.0.39:9131",
+		}},
+	}
+	st = statusFixture(func(p *Provider) {
+		p.ready = true
+		p.phase = "running"
+		p.connectedAt = time.Now().Add(-time.Minute)
+		p.relays = 4000
+		p.exitCount = 2743
+		p.client = connected
+	}).Status()
+	if st.State != "running" || st.Message != "" {
+		t.Fatalf("running: state=%q message=%q", st.State, st.Message)
+	}
+	if st.Details["guard"] != "moria1 (128.31.0.39:9131)" {
+		t.Fatalf("guard: %v", st.Details["guard"])
+	}
+	if st.Details["guard_link_alive"] != true {
+		t.Fatalf("guard_link_alive: %v", st.Details["guard_link_alive"])
+	}
+	if st.Details["relays"] != 9182 {
+		t.Fatalf("live RouterCount must override the bootstrap count: %v", st.Details["relays"])
+	}
+	if st.Details["exits_in_roster"] != 2743 {
+		t.Fatalf("exits_in_roster: %v", st.Details["exits_in_roster"])
+	}
+	if _, ok := st.Details["connected_since"]; !ok {
+		t.Fatal("running state must report connected_since")
+	}
+
+	// Running without the client status surface (mock predates it): no
+	// guard facts, bootstrap relays count stands.
+	bare := &fakeClient{}
+	st = statusFixture(func(p *Provider) {
+		p.ready = true
+		p.relays = 9182
+		p.client = bare
+	}).Status()
+	if st.State != "running" {
+		t.Fatalf("bare running: state=%q", st.State)
+	}
+	if _, ok := st.Details["guard"]; ok {
+		t.Fatal("no guard must be reported when the client has none")
+	}
+
+	// Terminal error wins over phase bookkeeping.
+	st = statusFixture(func(p *Provider) {
+		p.startErr = errors.New("init tor client: bad config")
+		p.phase = "connecting guard"
+	}).Status()
+	if st.State != "error" || st.Message != "init tor client: bad config" {
+		t.Fatalf("error: state=%q message=%q", st.State, st.Message)
+	}
+
+	// Stopped wins over everything.
+	st = statusFixture(func(p *Provider) {
+		p.closed = true
+		p.ready = true
+	}).Status()
+	if st.State != "stopped" {
+		t.Fatalf("stopped: state=%q", st.State)
+	}
+
+	// Zero-value config must not panic (VerifySignatures nil → default on).
+	st = statusFixture(nil).Status()
+	if st.State != "bootstrapping" {
+		t.Fatalf("zero fixture: state=%q", st.State)
+	}
+}
+
+// TestStatusRunsConcurrentlyWithOutbounds pins the engine contract: Status
+// is polled outside the provider's locks while Outbounds runs; both take
+// p.mu, so run them concurrently under -race.
+func TestStatusRunsConcurrentlyWithOutbounds(t *testing.T) {
+	p := statusFixture(func(p *Provider) {
+		p.ready = true
+		p.exitCount = 3
+		p.client = &fakeClient{exits: []torclient.RouterInfo{
+			{Nickname: "a", IDDigest: strings.Repeat("1", 40), Address: "1.2.3.4:9001"},
+			{Nickname: "b", IDDigest: strings.Repeat("2", 40), Address: "2.3.4.5:9002"},
+		}}
+	})
+	done := make(chan struct{})
+	go func() {
+		defer close(done)
+		for i := 0; i < 50; i++ {
+			if _, err := p.Outbounds(context.Background()); err != nil {
+				t.Errorf("Outbounds: %v", err)
+				return
+			}
+			_ = p.Status()
+		}
+	}()
+	<-done
 }

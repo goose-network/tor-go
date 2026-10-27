@@ -77,6 +77,10 @@ func init() {
 	pub.RegisterProvider("tor", NewProvider)
 }
 
+// The provider implements the optional observability contract the engine
+// merges into /api/providers/status.
+var _ pub.StatusReporter = (*Provider)(nil)
+
 // streamDialer is the tor-go client surface dialStream needs;
 // *torclient.Client implements it. An interface keeps the dial path testable
 // without a full Tor bootstrap. Per-exit pinning is a separate interface
@@ -99,8 +103,18 @@ type exitPinner interface {
 	DialStreamViaExit(ctx context.Context, hexDigest, target string) (io.ReadWriteCloser, error)
 }
 
+// statusSource is the client surface Status() reads for live facts: guard
+// link liveness, the guard relay circuits ride, and the directory size.
+// *torclient.Client implements it; test mocks may not (Status degrades
+// gracefully).
+type statusSource interface {
+	Connected() bool
+	Guard() *directory.Router
+	RouterCount() int
+}
+
 // Provider is a goose outbound provider backed by an embedded tor-go client.
-// It implements pub.Provider.
+// It implements pub.Provider and pub.StatusReporter.
 type Provider struct {
 	cfg providerConfig
 
@@ -111,6 +125,21 @@ type Provider struct {
 	client   streamDialer
 	ready    bool  // client is connected to its guard link
 	startErr error // last terminal startup error, surfaced via Outbounds
+
+	// Observability state for Status(), all guarded by mu: the bootstrap
+	// phase word, retry bookkeeping between attempts, and the directory /
+	// roster sizes. They let an operator tell a fetching, connecting,
+	// serving, or retrying provider apart from /api/providers/status
+	// without reading engine logs — the engine-side lifecycle alone cannot
+	// (it sees only "running" plus an empty pool).
+	phase       string     // current progress word: "fetching directory", "connecting guard", "running"
+	lastBootErr error      // last bootstrap failure; cleared when the client connects
+	attempts    int        // bootstrap attempts since the factory
+	nextRetry   time.Time  // when run() retries after lastBootErr (zero = n/a)
+	relays      int        // usable relays in the last fetched directory
+	exitCount   int        // exits in the roster at the last Outbounds emission
+	connectedAt time.Time  // guard link up since
+	closed      bool
 
 	// watch signals the engine that the outbound set changed (ready flip).
 	watchCh chan struct{}
@@ -269,6 +298,8 @@ func (p *Provider) run(ctx context.Context, linkDialer proxy.Dialer) {
 				p.setTerminal(err)
 				return
 			}
+			retryAt := time.Now().Add(backoff)
+			p.recordBootFailure(err, retryAt)
 			log.Printf("tor provider: bootstrap failed: %v (retrying in %s)", err, backoff)
 			select {
 			case <-ctx.Done():
@@ -291,6 +322,7 @@ func (p *Provider) run(ctx context.Context, linkDialer proxy.Dialer) {
 // Run exits cleanly via ctx cancellation.
 func (p *Provider) startOnce(ctx context.Context, linkDialer proxy.Dialer) error {
 	pc := p.cfg
+	p.setPhase("fetching directory")
 
 	// 1. Fetch the directory (consensus + microdescriptors). This is the
 	//    slow part: authorities, then one HTTP GET per microdescriptor
@@ -331,6 +363,10 @@ func (p *Provider) startOnce(ctx context.Context, linkDialer proxy.Dialer) error
 	if usable == 0 {
 		return errors.New("fetched directory has no relays with onion keys")
 	}
+	p.mu.Lock()
+	p.relays = usable
+	p.mu.Unlock()
+	p.setPhase("connecting guard")
 	log.Printf("tor provider: directory ready: %d relays (%d with onion keys)", len(dir), usable)
 
 	// 2. Build the client config. No SOCKS listener is configured: the
@@ -423,6 +459,9 @@ func (p *Provider) awaitConnected(ctx context.Context, cli *torclient.Client, ru
 		if cli.Connected() {
 			p.mu.Lock()
 			p.ready = true
+			p.phase = "running"
+			p.connectedAt = time.Now()
+			p.lastBootErr = nil
 			p.mu.Unlock()
 			log.Printf("tor provider: tor-go client connected to guard")
 			p.signalWatch()
@@ -446,6 +485,91 @@ func (p *Provider) setNotReady() {
 	p.ready = false
 	p.mu.Unlock()
 	p.signalWatch()
+}
+
+// setPhase records the bootstrap progress word surfaced as Status's message
+// while the provider is not yet serving.
+func (p *Provider) setPhase(phase string) {
+	p.mu.Lock()
+	p.phase = phase
+	p.mu.Unlock()
+}
+
+// recordBootFailure notes the failure that ended the last bootstrap attempt
+// and when run() will try again, so Status can explain an empty pool with
+// "retrying after <error>" instead of an unspeaking "running" entry.
+func (p *Provider) recordBootFailure(err error, retryAt time.Time) {
+	p.mu.Lock()
+	p.lastBootErr = err
+	p.attempts++
+	p.nextRetry = retryAt
+	p.mu.Unlock()
+}
+
+// Status reports the provider's live self-assessment for the engine's
+// provider-observability view (pub.StatusReporter): bootstrap phase and
+// retry state while the pool is still empty, the guard link and guard relay
+// once serving, plus the directory and roster sizes and the config knobs an
+// operator needs to interpret them. Pure in-memory reads — safe for the
+// engine to poll alongside Outbounds.
+func (p *Provider) Status() pub.ProviderStatus {
+	p.mu.Lock()
+	defer p.mu.Unlock()
+
+	// Config echo knobs; VerifySignatures defaults on (the factory always
+	// materializes it, but Status must not panic on a zero-value struct).
+	verify := true
+	if p.cfg.VerifySignatures != nil {
+		verify = *p.cfg.VerifySignatures
+	}
+	details := map[string]any{
+		"upstream_proxy":    p.cfg.UpstreamProxy != "",
+		"verify_signatures": verify,
+		"use_fallbacks":     p.cfg.UseFallbacks,
+		"path_len":          p.cfg.PathLen,
+		"relays":            p.relays,
+		"exits_in_roster":   p.exitCount,
+	}
+	// Live client facts when the client surface allows them; the bootstrap
+	// fetch's count stands in for relays before a client exists.
+	if src, ok := p.client.(statusSource); ok {
+		if rc := src.RouterCount(); rc > 0 {
+			details["relays"] = rc
+		}
+		details["guard_link_alive"] = src.Connected()
+		if g := src.Guard(); g != nil {
+			details["guard"] = g.Nickname + " (" + g.Address + ")"
+		}
+	}
+	if !p.connectedAt.IsZero() {
+		details["connected_since"] = p.connectedAt.UTC().Format(time.RFC3339)
+	}
+
+	st := pub.ProviderStatus{Details: details}
+	switch {
+	case p.closed:
+		st.State = "stopped"
+	case p.startErr != nil:
+		st.State = "error"
+		st.Message = p.startErr.Error()
+	case p.ready:
+		st.State = "running"
+	default:
+		// Not serving: an attempt is either underway or scheduled. Surface
+		// which, with the progress word / failure / backoff tick.
+		details["attempts"] = p.attempts
+		if p.lastBootErr != nil {
+			st.State = "retrying"
+			st.Message = p.lastBootErr.Error()
+			if !p.nextRetry.IsZero() {
+				details["next_retry_at"] = p.nextRetry.UTC().Format(time.RFC3339)
+			}
+		} else {
+			st.State = "bootstrapping"
+			st.Message = p.phase
+		}
+	}
+	return st
 }
 
 // Name returns the provider plugin name.
@@ -495,7 +619,13 @@ func (p *Provider) Outbounds(_ context.Context) ([]pub.OutboundConfig, error) {
 		// still works. (Only the mock in tests takes this branch.)
 		return out, nil
 	}
-	for _, r := range lister.ExitInfos() {
+	exits := lister.ExitInfos()
+	// Cache the roster size for Status() so the observability poll stays a
+	// field read instead of re-walking the directory here.
+	p.mu.Lock()
+	p.exitCount = len(exits)
+	p.mu.Unlock()
+	for _, r := range exits {
 		exitID := id + "-" + r.Nickname + "-" + r.IDDigest[:12]
 		out = append(out, pub.OutboundConfig{
 			ID:       exitID,
@@ -524,6 +654,7 @@ func (p *Provider) Close() error {
 	p.mu.Lock()
 	p.ready = false
 	p.client = nil
+	p.closed = true
 	p.mu.Unlock()
 	return nil
 }
