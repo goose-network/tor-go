@@ -4,7 +4,9 @@ import (
 	"context"
 	"errors"
 	"io"
+	"net"
 	"strings"
+	"sync"
 	"testing"
 	"time"
 
@@ -14,6 +16,142 @@ import (
 	"github.com/goose-network/tor-go/internal/link"
 	"github.com/goose-network/tor-go/internal/torclient"
 )
+
+// dialRecorder is the shared recording core of the fake stack and route
+// dialers below: one entry per dial, "network address".
+type dialRecorder struct {
+	mu    sync.Mutex
+	dials []string
+}
+
+func (r *dialRecorder) record(network, address string) {
+	r.mu.Lock()
+	r.dials = append(r.dials, network+" "+address)
+	r.mu.Unlock()
+}
+
+func (r *dialRecorder) recorded() []string {
+	r.mu.Lock()
+	defer r.mu.Unlock()
+	return append([]string{}, r.dials...)
+}
+
+// fakeStackDialer is a pub.StackDialer answering Dial with a recorded pipe
+// conn.
+type fakeStackDialer struct{ rec *dialRecorder }
+
+func (f fakeStackDialer) Dial(ctx context.Context, network, address string) (net.Conn, error) {
+	f.rec.record(network, address)
+	c1, c2 := net.Pipe()
+	go func() { <-ctx.Done(); _ = c2.Close() }()
+	return c1, nil
+}
+
+// fakeUpstreamDialer is a pub.UpstreamDialer answering DialUpstream with a
+// recorded pipe conn.
+type fakeUpstreamDialer struct{ rec *dialRecorder }
+
+func (f fakeUpstreamDialer) DialUpstream(ctx context.Context, network, address string) (net.Conn, error) {
+	f.rec.record(network, address)
+	c1, c2 := net.Pipe()
+	go func() { <-ctx.Done(); _ = c2.Close() }()
+	return c1, nil
+}
+
+// TestEngineLinkDialerPrecedence verifies the dialer choice NewProvider
+// hands tor-go's link layer: an injected engine route (a goose
+// outbound/pool/chain) outranks the engine stack, which outranks tor-go's
+// own dialer, and the chosen dialer is called with the dial arguments
+// verbatim. It also reports the route choice, which suppresses the raw
+// upstream_proxy address.
+func TestEngineLinkDialerPrecedence(t *testing.T) {
+	d, viaRoute := engineLinkDialer(map[string]any{})
+	if d != nil || viaRoute {
+		t.Fatal("engineLinkDialer(empty) must be (nil, false)")
+	}
+
+	ctx, cancel := context.WithCancel(context.Background())
+	defer cancel()
+
+	stackRec, routeRec := &dialRecorder{}, &dialRecorder{}
+	d, viaRoute = engineLinkDialer(map[string]any{
+		pub.StackDialerKey:    fakeStackDialer{stackRec},
+		pub.UpstreamDialerKey: fakeUpstreamDialer{routeRec},
+	})
+	if !viaRoute {
+		t.Fatal("injected route not reported")
+	}
+	conn, err := d(ctx, "tcp", "128.31.0.39:9131")
+	if err != nil {
+		t.Fatalf("dial through the route: %v", err)
+	}
+	_ = conn.Close()
+	if got := routeRec.recorded(); len(got) != 1 || got[0] != "tcp 128.31.0.39:9131" {
+		t.Fatalf("route dialed %v, want one tcp dial to the authority ORPort", got)
+	}
+	if got := stackRec.recorded(); len(got) != 0 {
+		t.Fatalf("stack dialed %v, want none — the route outranks the stack", got)
+	}
+
+	stackRec = &dialRecorder{}
+	d, viaRoute = engineLinkDialer(map[string]any{
+		pub.StackDialerKey: fakeStackDialer{stackRec},
+	})
+	if viaRoute {
+		t.Fatal("stack-only injection must not report a route")
+	}
+	if _, err := d(ctx, "tcp", "128.31.0.39:9131"); err != nil {
+		t.Fatalf("dial through the stack: %v", err)
+	}
+	if got := stackRec.recorded(); len(got) != 1 || got[0] != "tcp 128.31.0.39:9131" {
+		t.Fatalf("stack dialed %v, want one tcp dial to the authority ORPort", got)
+	}
+}
+
+// TestNewProviderRouteSupersedesRawUpstream verifies the factory behavior:
+// an injected engine route carries the client's connections and the config's
+// raw upstream_proxy address is dropped (tor-go would chain a SOCKS5 hop
+// inside the route — double-proxying). The background bootstrap's directory
+// fetch dials through the route, observable on the fake's recorder.
+func TestNewProviderRouteSupersedesRawUpstream(t *testing.T) {
+	routeRec := &dialRecorder{}
+	p, err := NewProvider(map[string]any{
+		"upstream_proxy":        "127.0.0.1:7890", // would double-proxy inside the route
+		"fetch_timeout_seconds": 1,
+		pub.UpstreamDialerKey:   fakeUpstreamDialer{routeRec},
+	})
+	if err != nil {
+		t.Fatalf("NewProvider: %v", err)
+	}
+	prov := p.(*Provider)
+	defer prov.Close()
+
+	if prov.cfg.UpstreamProxy != "" {
+		t.Fatalf("raw upstream_proxy = %q, want dropped for the injected route", prov.cfg.UpstreamProxy)
+	}
+	if !prov.viaRoute {
+		t.Fatal("provider does not record the injected route")
+	}
+
+	// The bootstrap fetch dials the authorities through the route (not the
+	// raw address, not a kernel socket). Poll: the fetch has a 1s timeout
+	// and retries with backoff, so wait a few seconds for the first dial.
+	deadline := time.Now().Add(5 * time.Second)
+	for len(routeRec.recorded()) == 0 && time.Now().Before(deadline) {
+		time.Sleep(50 * time.Millisecond)
+	}
+	if got := routeRec.recorded(); len(got) == 0 {
+		t.Fatal("directory fetch never dialed through the injected route")
+	}
+
+	st := prov.Status()
+	if st.Details["engine_route"] != true {
+		t.Fatalf("Status engine_route = %v, want true", st.Details["engine_route"])
+	}
+	if st.Details["upstream_proxy"] != false {
+		t.Fatalf("Status upstream_proxy = %v, want false (dropped for the route)", st.Details["upstream_proxy"])
+	}
+}
 
 // fakeClient is a stand-in for the tor-go client used by provider tests that
 // exercise the dial path without a real Tor bootstrap. It satisfies the

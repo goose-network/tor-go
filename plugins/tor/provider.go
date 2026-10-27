@@ -11,8 +11,9 @@
 // circuit IN PROCESS — the outbound calls the client's DialStream directly
 // (with the exit hop pinned on per-relay outbounds) — so there is no
 // SOCKS/HTTP hop between goose and the Tor client, and the client's own
-// connections (guard link, directory fetches) dial through the engine's
-// layer-3/4 stack.
+// connections (guard link, directory fetches) dial through the engine: an
+// injected upstream route (a goose outbound/pool/chain) when the provider
+// spec's upstream_proxy names one, else the engine's layer-3/4 stack.
 //
 // This package lives inside the tor-go module (not a separate repo) because
 // it embeds tor-go's internal packages (internal/torclient, internal/directory),
@@ -39,7 +40,8 @@
 // The provider config is a JSON object:
 //
 //	{
-//	  "upstream_proxy":           "127.0.0.1:7890",  // SOCKS5 to reach relays/authorities
+//	  "upstream_proxy":           "127.0.0.1:7890",  // SOCKS5 to reach relays/authorities; superseded by a
+//	                                                   // spec-level upstream_proxy naming a goose route
 //	  "path_len":                 3,                 // circuit hops (default 3)
 //	  "outbound_id":              "tor",             // goose outbound id (default "tor")
 //	  "fetch_timeout_seconds":    300,               // directory bootstrap timeout
@@ -118,6 +120,12 @@ type statusSource interface {
 type Provider struct {
 	cfg providerConfig
 
+	// viaRoute records that the engine injected an upstream-route dialer
+	// (the spec's upstream_proxy names a goose route), which carries the
+	// client's own connections in place of the stack dialer and the config's
+	// raw upstream_proxy address. Surfaced through Status.
+	viaRoute bool
+
 	// client is the running tor-go client, guarded by mu. It is non-nil from
 	// the moment a bootstrap attempt creates it until that attempt's Run
 	// exits; dials while it is nil or not connected fail fast.
@@ -132,13 +140,13 @@ type Provider struct {
 	// serving, or retrying provider apart from /api/providers/status
 	// without reading engine logs — the engine-side lifecycle alone cannot
 	// (it sees only "running" plus an empty pool).
-	phase       string     // current progress word: "fetching directory", "connecting guard", "running"
-	lastBootErr error      // last bootstrap failure; cleared when the client connects
-	attempts    int        // bootstrap attempts since the factory
-	nextRetry   time.Time  // when run() retries after lastBootErr (zero = n/a)
-	relays      int        // usable relays in the last fetched directory
-	exitCount   int        // exits in the roster at the last Outbounds emission
-	connectedAt time.Time  // guard link up since
+	phase       string    // current progress word: "fetching directory", "connecting guard", "running"
+	lastBootErr error     // last bootstrap failure; cleared when the client connects
+	attempts    int       // bootstrap attempts since the factory
+	nextRetry   time.Time // when run() retries after lastBootErr (zero = n/a)
+	relays      int       // usable relays in the last fetched directory
+	exitCount   int       // exits in the roster at the last Outbounds emission
+	connectedAt time.Time // guard link up since
 	closed      bool
 
 	// watch signals the engine that the outbound set changed (ready flip).
@@ -163,6 +171,22 @@ type providerConfig struct {
 	AllowPrivateAddresses      bool   `json:"allow_private_addresses"`
 }
 
+// engineLinkDialer picks the dialer tor-go's link layer dials through: the
+// engine-injected route dialer when the provider spec's upstream_proxy names
+// a goose route (outbound:/pool:/chain:), else the engine's stack dialer —
+// nil when the plugin embeds neither (tor-go's own dialer). The second
+// return reports whether a route was chosen, i.e. whether it supersedes the
+// plugin config's raw upstream_proxy address.
+func engineLinkDialer(cfg map[string]any) (proxy.Dialer, bool) {
+	if ud := pub.AsUpstreamDialer(cfg); ud != nil {
+		return ud.DialUpstream, true
+	}
+	if sd := pub.AsStackDialer(cfg); sd != nil {
+		return sd.Dial, false
+	}
+	return nil, false
+}
+
 // NewProvider is the ProviderFactory registered as "tor". It parses the config and
 // starts the tor-go client bootstrap in the background; Outbounds returns a
 // "tor" protocol outbound once the client is connected, and an empty set
@@ -184,19 +208,29 @@ func NewProvider(cfg map[string]any) (pub.Provider, error) {
 		pc.VerifySignatures = &on
 	}
 
-	// The engine injects its stack dialer under pub.StackDialerKey; route
-	// the client's own connections (guard link, directory fetches, fallback
-	// ORPorts, and the upstream SOCKS5 hop itself) through it so the plugin
-	// uses the engine's layer-3/4 stack instead of the raw system dialer.
-	var linkDialer proxy.Dialer
-	if sd := pub.AsStackDialer(cfg); sd != nil {
-		linkDialer = sd.Dial
+	// The engine injects its dialers into the config map: the stack dialer
+	// under pub.StackDialerKey, and — when the provider spec's
+	// upstream_proxy names a goose route (outbound:/pool:/chain:) — the
+	// route dialer under pub.UpstreamDialerKey. Route the client's own
+	// connections (guard link, directory fetches, fallback ORPorts) through
+	// whichever it has, so the plugin uses the engine route as its upstream
+	// proxy or the engine's layer-3/4 stack instead of the raw system
+	// dialer.
+	linkDialer, viaRoute := engineLinkDialer(cfg)
+	if viaRoute {
+		// The route supersedes the plugin config's raw upstream_proxy
+		// address: tor-go would chain a SOCKS5 hop INSIDE the engine route
+		// (double-proxying through a raw address the operator probably
+		// meant to replace), so the raw address is dropped and the route
+		// dials relays directly.
+		pc.UpstreamProxy = ""
 	}
 
 	p := &Provider{
-		cfg:     pc,
-		watchCh: make(chan struct{}, 1),
-		stopped: make(chan struct{}),
+		cfg:      pc,
+		viaRoute: viaRoute,
+		watchCh:  make(chan struct{}, 1),
+		stopped:  make(chan struct{}),
 	}
 
 	ctx, cancel := context.WithCancel(context.Background())
@@ -326,7 +360,8 @@ func (p *Provider) startOnce(ctx context.Context, linkDialer proxy.Dialer) error
 
 	// 1. Fetch the directory (consensus + microdescriptors). This is the
 	//    slow part: authorities, then one HTTP GET per microdescriptor
-	//    digest. Every fetch dials through the engine stack (linkDialer).
+	//    digest. Every fetch dials through the engine (linkDialer: the
+	//    injected route, else the engine stack).
 	timeout := time.Duration(pc.FetchTimeoutSeconds) * time.Second
 	if timeout == 0 {
 		timeout = 5 * time.Minute
@@ -524,6 +559,7 @@ func (p *Provider) Status() pub.ProviderStatus {
 	}
 	details := map[string]any{
 		"upstream_proxy":    p.cfg.UpstreamProxy != "",
+		"engine_route":      p.viaRoute, // route carries guard/dir dials; stack never consulted
 		"verify_signatures": verify,
 		"use_fallbacks":     p.cfg.UseFallbacks,
 		"path_len":          p.cfg.PathLen,
