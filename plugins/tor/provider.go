@@ -27,13 +27,15 @@
 // select a guard, and complete a TLS link handshake before it can serve a
 // single byte — easily a minute on first run. The provider therefore starts
 // tor-go in a background goroutine from the factory (mirroring the Psiphon
-// provider's startTunnel): Outbounds returns an empty set until the client
-// is connected, then signals Watch so the engine repolls promptly and the
-// pool fills in without waiting for the 2-minute fallback poll. A bootstrap
-// failure (upstream down, authorities unreachable) is retried with backoff
-// in the same goroutine rather than failing the factory, so a temporarily
-// dead network does not permanently kill the provider; Outbounds keeps
-// returning empty and the pool simply stays empty.
+// provider's startTunnel). The directory fetch is the server-list source: as
+// soon as it completes, Outbounds advertises one outbound per Exit-flagged
+// relay — independent of the guard link, like psiphon's datastore server list —
+// and adds the general "tor" outbound once the client is connected, signaling
+// Watch so the engine repolls promptly without waiting for the 2-minute
+// fallback poll. A bootstrap failure (upstream down, authorities unreachable)
+// is retried with backoff in the same goroutine rather than failing the
+// factory, so a temporarily dead network does not permanently kill the
+// provider; the last fetched roster stays advertised meanwhile.
 //
 // # Config
 //
@@ -149,6 +151,13 @@ type Provider struct {
 	connectedAt time.Time // guard link up since
 	closed      bool
 
+	// exits is the exit roster snapshotted when a bootstrap attempt creates the
+	// client (the directory is fetched by then). It persists across guard-link
+	// retries — when client is cleared after a failed guard connection — so the
+	// discovered servers stay advertised independent of guard readiness, the
+	// tor analogue of psiphon's datastore server list. Guarded by mu.
+	exits []torclient.RouterInfo
+
 	// watch signals the engine that the outbound set changed (ready flip).
 	watchCh chan struct{}
 
@@ -188,9 +197,9 @@ func engineLinkDialer(cfg map[string]any) (proxy.Dialer, bool) {
 }
 
 // NewProvider is the ProviderFactory registered as "tor". It parses the config and
-// starts the tor-go client bootstrap in the background; Outbounds returns a
-// "tor" protocol outbound once the client is connected, and an empty set
-// before.
+// starts the tor-go client bootstrap in the background; Outbounds advertises the
+// discovered exit roster as soon as the directory is fetched (independent of the
+// guard link) and adds the general "tor" outbound once the client connects.
 func NewProvider(cfg map[string]any) (pub.Provider, error) {
 	pc, err := parseConfig(cfg)
 	if err != nil {
@@ -443,7 +452,14 @@ func (p *Provider) startOnce(ctx context.Context, linkDialer proxy.Dialer) error
 	}
 	p.mu.Lock()
 	p.client = cli
+	// Snapshot the discovered exit roster now: the directory is loaded, so it
+	// is available before the guard link connects. Outbounds advertises it
+	// independent of guard readiness (like psiphon's datastore server list),
+	// and the snapshot survives a failed guard attempt clearing client, so the
+	// servers stay listed while run() retries the bootstrap.
+	p.exits = cli.ExitInfos()
 	p.mu.Unlock()
+	p.signalWatch()
 
 	// 3. Run until cancelled: connect the guard, keep the link alive
 	//    (padding + self-healing redial), refresh the consensus hourly. A
@@ -614,15 +630,16 @@ func (p *Provider) Name() string { return "tor" }
 // Watch returns the change signal channel.
 func (p *Provider) Watch() <-chan struct{} { return p.watchCh }
 
-// Outbounds returns the current outbound set: empty until the tor-go client
-// is connected, then one general "tor" outbound (random exit per circuit)
-// PLUS one outbound per Exit-flagged relay in the client's directory — the
-// tor equivalent of the psiphon provider's per-server list — so the engine
-// (and the web UI) can show and pin the real relay roster. Per-exit outbounds
-// are named <id>-<nickname>-<digest-prefix> and pin the circuit's exit hop
-// to that relay via the "exit" config key. A terminal bootstrap failure
-// returns the error so the engine logs it (the existing pool, if any, is
-// kept).
+// Outbounds returns the current outbound set: one outbound per Exit-flagged
+// relay in the fetched directory — the tor equivalent of the psiphon provider's
+// per-server list — advertised as soon as the directory is retrieved,
+// independent of guard-link readiness, so the engine (and the web UI) can show
+// and pin the real relay roster zero-config. The general "tor" outbound (random
+// exit per circuit, riding a live guard link) is added once the client is
+// connected. Per-exit outbounds are named <id>-<nickname>-<digest-prefix> and
+// pin the circuit's exit hop to that relay via the "exit" config key. A terminal
+// bootstrap failure returns the error so the engine logs it (the existing pool,
+// if any, is kept).
 func (p *Provider) Outbounds(_ context.Context) ([]pub.OutboundConfig, error) {
 	p.mu.Lock()
 	ready := p.ready
@@ -630,16 +647,35 @@ func (p *Provider) Outbounds(_ context.Context) ([]pub.OutboundConfig, error) {
 	cli := p.client
 	id := p.cfg.OutboundID
 	allowPrivate := p.cfg.AllowPrivateAddresses
+	snapshot := append([]torclient.RouterInfo(nil), p.exits...)
 	p.mu.Unlock()
 	if err != nil {
 		return nil, err
 	}
-	if !ready {
-		return nil, nil
-	}
 
-	out := []pub.OutboundConfig{
-		{
+	// The exit roster is advertised as soon as the directory is fetched,
+	// independent of guard-link readiness — like psiphon emitting its datastore
+	// servers without waiting for the main tunnel. Prefer the live client's
+	// roster (fresh across the hourly consensus refresh) when it is up; else
+	// fall back to the snapshot taken at fetch time, which persists across
+	// guard-link retries so the discovered servers stay listed.
+	exits := snapshot
+	if cli != nil {
+		if lister, ok := cli.(exitLister); ok {
+			exits = lister.ExitInfos()
+		}
+	}
+	// Cache the roster size for Status() so the observability poll stays a
+	// field read instead of re-walking the directory here.
+	p.mu.Lock()
+	p.exitCount = len(exits)
+	p.mu.Unlock()
+
+	// The general "tor" outbound rides a live circuit, so it is added only once
+	// the guard link is up; the per-exit list represents the discovered relays.
+	var out []pub.OutboundConfig
+	if ready {
+		out = append(out, pub.OutboundConfig{
 			ID:       id,
 			Protocol: "tor",
 			Config: map[string]any{
@@ -647,20 +683,8 @@ func (p *Provider) Outbounds(_ context.Context) ([]pub.OutboundConfig, error) {
 				"tunnel":        id,
 				"allow_private": allowPrivate,
 			},
-		},
+		})
 	}
-	lister, ok := cli.(exitLister)
-	if !ok {
-		// The client predates the exit-roster surface; the general outbound
-		// still works. (Only the mock in tests takes this branch.)
-		return out, nil
-	}
-	exits := lister.ExitInfos()
-	// Cache the roster size for Status() so the observability poll stays a
-	// field read instead of re-walking the directory here.
-	p.mu.Lock()
-	p.exitCount = len(exits)
-	p.mu.Unlock()
 	for _, r := range exits {
 		exitID := id + "-" + r.Nickname + "-" + r.IDDigest[:12]
 		out = append(out, pub.OutboundConfig{

@@ -292,6 +292,43 @@ func TestOutboundsEmptyUntilReady(t *testing.T) {
 	}
 }
 
+// TestOutboundsEmitRosterWhileConnecting verifies the roster is advertised
+// independent of guard-link readiness: with a snapshotted exit roster but no
+// live guard (the slow/censored-bootstrap state), Outbounds emits the per-exit
+// outbounds — the discovered relays — without the general outbound, which awaits
+// a circuit. This is the tor analogue of psiphon emitting its datastore servers
+// without waiting for the main tunnel.
+func TestOutboundsEmitRosterWhileConnecting(t *testing.T) {
+	p := &Provider{
+		cfg:     providerConfig{OutboundID: "tor-list"},
+		watchCh: make(chan struct{}, 1),
+		stopped: make(chan struct{}),
+	}
+	p.mu.Lock()
+	p.ready = false // guard link not up yet
+	p.exits = []torclient.RouterInfo{
+		{Nickname: "relayA", IDDigest: "aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa", Address: "1.2.3.4:9001", IsExit: true},
+		{Nickname: "relayB", IDDigest: "bbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbb", Address: "5.6.7.8:9002", IsExit: true},
+	}
+	p.mu.Unlock()
+
+	out, err := p.Outbounds(context.Background())
+	if err != nil {
+		t.Fatalf("Outbounds: %v", err)
+	}
+	if len(out) != 2 {
+		t.Fatalf("got %d outbounds, want 2 (per-exit only, no general while connecting)", len(out))
+	}
+	for _, o := range out {
+		if _, pinned := o.Config["exit"]; !pinned {
+			t.Fatalf("outbound %q is not a per-exit pin (general outbound leaked while connecting)", o.ID)
+		}
+	}
+	if out[0].ID != "tor-list-relayA-aaaaaaaaaaaa" || out[1].ID != "tor-list-relayB-bbbbbbbbbbbb" {
+		t.Fatalf("per-exit outbounds unexpected: %q, %q", out[0].ID, out[1].ID)
+	}
+}
+
 // TestOutboundsAfterReady verifies the ready flip: once the client is
 // connected, Outbounds emits one "tor" protocol outbound wired to this
 // provider, and it signals Watch. No address is emitted — the dial goes

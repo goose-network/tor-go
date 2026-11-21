@@ -3,11 +3,13 @@
 This package is the [goose](https://github.com/goose-network/goose) proxy-pool
 engine's **tor provider plugin**: it embeds tor-go — a from-scratch Go Tor
 client — as a library and exposes it to goose as a dynamic source of outbounds
-(the same shape as the Psiphon provider embedding tunnel-core). Once the
-embedded client has connected to its guard, the provider advertises one
-`tor`-protocol outbound; a dial through it opens a Tor circuit **in process**
-— the outbound calls the client's `DialStream` directly — so no SOCKS/HTTP
-hop exists between goose and the Tor client:
+(the same shape as the Psiphon provider embedding tunnel-core). As soon as the
+directory is fetched, the provider advertises one `tor`-protocol outbound per
+Exit-flagged relay — independent of the guard link, like psiphon's server list —
+and adds the general outbound once the client connects to its guard. A dial
+through an outbound opens a Tor circuit **in process** — the outbound calls the
+client's `DialStream` directly — so no SOCKS/HTTP hop exists between goose and
+the Tor client:
 
 ```
 goose inbound ──▶ pool ──▶ "tor" outbound ──▶ DialStream (in process, no listener)
@@ -69,13 +71,16 @@ guard, and complete a TLS link handshake before it can serve a single byte —
 easily a minute on first run. The provider therefore starts tor-go in a
 background goroutine from the factory:
 
-- `Outbounds()` returns an **empty set** until the client is connected to its
-  guard link, then signals `Watch()` so the engine repolls promptly instead
-  of waiting for the 2-minute fallback poll.
+- `Outbounds()` advertises **one outbound per Exit-flagged relay** as soon as
+  the directory is fetched — independent of guard-link readiness, the tor
+  analogue of psiphon's datastore server list — and adds the general `tor`
+  outbound once the client connects to its guard. Each change signals `Watch()`
+  so the engine repolls promptly instead of waiting for the 2-minute fallback
+  poll.
 - A failed bootstrap (upstream down, authorities unreachable, no relays with
   onion keys) is retried with exponential backoff capped at 60s in the same
-  goroutine — a temporarily dead network does not kill the provider; the pool
-  simply stays empty.
+  goroutine — a temporarily dead network does not kill the provider; the last
+  fetched roster stays advertised meanwhile.
 - The whole client lifetime is tied to the provider's context: cancelling it
   stops the guard link, the consensus refresh, and the idle-tunnel keep-alive
   loop (`Client.Run`; no listener is ever bound).
