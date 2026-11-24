@@ -79,6 +79,10 @@ import (
 
 func init() {
 	pub.RegisterProvider("tor", NewProvider)
+	// Zero-config: the embedded directory authorities fetch the relay roster
+	// with an empty config map, so the engine auto-seeds a tor provider — it
+	// appears in the admin UI without operator setup.
+	pub.RegisterDefaultProvider(pub.DefaultProvider{Provider: "tor"})
 }
 
 // The provider implements the optional observability contract the engine
