@@ -3,6 +3,7 @@ package tor
 import (
 	"context"
 	"errors"
+	"fmt"
 	"io"
 	"net"
 	"strings"
@@ -14,6 +15,7 @@ import (
 
 	"github.com/goose-network/tor-go/internal/directory"
 	"github.com/goose-network/tor-go/internal/link"
+	"github.com/goose-network/tor-go/internal/testharness"
 	"github.com/goose-network/tor-go/internal/torclient"
 )
 
@@ -58,53 +60,260 @@ func (f fakeUpstreamDialer) DialUpstream(ctx context.Context, network, address s
 	return c1, nil
 }
 
-// TestEngineLinkDialerPrecedence verifies the dialer choice NewProvider
-// hands tor-go's link layer: an injected engine route (a goose
-// outbound/pool/chain) outranks the engine stack, which outranks tor-go's
-// own dialer, and the chosen dialer is called with the dial arguments
-// verbatim. It also reports the route choice, which suppresses the raw
-// upstream_proxy address.
-func TestEngineLinkDialerPrecedence(t *testing.T) {
-	d, viaRoute := engineLinkDialer(map[string]any{})
-	if d != nil || viaRoute {
-		t.Fatal("engineLinkDialer(empty) must be (nil, false)")
+// TestEngineDialerPlanes verifies the two-plane dialer resolution NewProvider
+// wires: the guard link (data path) takes the engine stack and NEVER the
+// injected upstream route, while the directory fetches (control plane) take
+// the route when injected, else the stack, else tor-go's own dialer. Each
+// chosen dialer is called with the dial arguments verbatim.
+func TestEngineDialerPlanes(t *testing.T) {
+	ctx, cancel := context.WithCancel(context.Background())
+	defer cancel()
+
+	// No injection: both planes fall back to tor-go's own dialer (nil).
+	if d := engineStackDialer(map[string]any{}); d != nil {
+		t.Fatal("engineStackDialer(empty) must be nil")
+	}
+	if d, viaRoute := engineFetchDialer(map[string]any{}); d != nil || viaRoute {
+		t.Fatal("engineFetchDialer(empty) must be (nil, false)")
+	}
+
+	// Both injected: the link takes the stack, the fetch takes the route.
+	stackRec, routeRec := &dialRecorder{}, &dialRecorder{}
+	cfg := map[string]any{
+		pub.StackDialerKey:    fakeStackDialer{stackRec},
+		pub.UpstreamDialerKey: fakeUpstreamDialer{routeRec},
+	}
+	link := engineStackDialer(cfg)
+	fetch, viaRoute := engineFetchDialer(cfg)
+	if !viaRoute {
+		t.Fatal("injected route not reported by engineFetchDialer")
+	}
+	conn, err := link(ctx, "tcp", "1.2.3.4:9001") // a relay ORPort
+	if err != nil {
+		t.Fatalf("link dial: %v", err)
+	}
+	_ = conn.Close()
+	if got := stackRec.recorded(); len(got) != 1 || got[0] != "tcp 1.2.3.4:9001" {
+		t.Fatalf("link dialed %v, want one tcp dial to the relay via the stack", got)
+	}
+	if got := routeRec.recorded(); len(got) != 0 {
+		t.Fatalf("route dialed %v, want none — the guard link never rides the upstream route", got)
+	}
+	conn, err = fetch(ctx, "tcp", "128.31.0.39:9231") // an authority dirport
+	if err != nil {
+		t.Fatalf("fetch dial: %v", err)
+	}
+	_ = conn.Close()
+	if got := routeRec.recorded(); len(got) != 1 || got[0] != "tcp 128.31.0.39:9231" {
+		t.Fatalf("fetch dialed %v, want one tcp dial to the authority via the route", got)
+	}
+
+	// Stack only: the fetch falls back to the stack, no route reported.
+	stackRec = &dialRecorder{}
+	cfg = map[string]any{pub.StackDialerKey: fakeStackDialer{stackRec}}
+	fetch, viaRoute = engineFetchDialer(cfg)
+	if viaRoute {
+		t.Fatal("stack-only injection must not report a route")
+	}
+	if _, err := fetch(ctx, "tcp", "128.31.0.39:9231"); err != nil {
+		t.Fatalf("fetch dial through the stack: %v", err)
+	}
+	if got := stackRec.recorded(); len(got) != 1 || got[0] != "tcp 128.31.0.39:9231" {
+		t.Fatalf("stack dialed %v, want one tcp dial to the authority", got)
+	}
+}
+
+// recordingDialer records each dial then delegates to the system dialer, so a
+// real TLS/link handshake against the mock relay completes while the test
+// observes which dialer carried the connection.
+type recordingDialer struct{ rec *dialRecorder }
+
+func (d recordingDialer) Dial(ctx context.Context, network, address string) (net.Conn, error) {
+	d.rec.record(network, address)
+	var dl net.Dialer
+	return dl.DialContext(ctx, network, address)
+}
+
+// TestClientConfigScopesUpstreamToFetches pins the provider's core transport
+// contract at the config seam: the guard link rides the stack dialer with NO
+// upstream SOCKS5 hop (Config.UpstreamProxy empty), while the directory fetches
+// carry the upstream — the injected route dialer, or the config's raw SOCKS5
+// address over the stack. This is what keeps the outbounds' data path off the
+// provider upstream.
+func TestClientConfigScopesUpstreamToFetches(t *testing.T) {
+	on := true
+	stackRec, routeRec := &dialRecorder{}, &dialRecorder{}
+	p := &Provider{cfg: providerConfig{
+		OutboundID:       "tor",
+		UpstreamProxy:    "127.0.0.1:7890", // raw fetch upstream
+		VerifySignatures: &on,
+	}}
+	d := dialPlanes{
+		link:  fakeStackDialer{stackRec}.Dial,
+		fetch: fakeUpstreamDialer{routeRec}.DialUpstream,
+	}
+	cfg := p.clientConfig(map[string]*directory.Router{}, d, 30*time.Second)
+
+	if cfg.UpstreamProxy != "" {
+		t.Fatalf("Config.UpstreamProxy = %q, want empty — the guard link must never chain the provider upstream", cfg.UpstreamProxy)
+	}
+	if cfg.FetchOptions == nil {
+		t.Fatal("FetchOptions must be set to carry the fetch upstream")
+	}
+	if cfg.FetchOptions.UpstreamProxy != "127.0.0.1:7890" {
+		t.Fatalf("FetchOptions.UpstreamProxy = %q, want the raw fetch upstream", cfg.FetchOptions.UpstreamProxy)
 	}
 
 	ctx, cancel := context.WithCancel(context.Background())
 	defer cancel()
-
-	stackRec, routeRec := &dialRecorder{}, &dialRecorder{}
-	d, viaRoute = engineLinkDialer(map[string]any{
-		pub.StackDialerKey:    fakeStackDialer{stackRec},
-		pub.UpstreamDialerKey: fakeUpstreamDialer{routeRec},
-	})
-	if !viaRoute {
-		t.Fatal("injected route not reported")
-	}
-	conn, err := d(ctx, "tcp", "128.31.0.39:9131")
+	// The guard-link dialer is the stack; the fetch dialer is the route.
+	conn, err := cfg.LinkDialer(ctx, "tcp", "1.2.3.4:9001")
 	if err != nil {
-		t.Fatalf("dial through the route: %v", err)
+		t.Fatalf("LinkDialer: %v", err)
 	}
 	_ = conn.Close()
-	if got := routeRec.recorded(); len(got) != 1 || got[0] != "tcp 128.31.0.39:9131" {
-		t.Fatalf("route dialed %v, want one tcp dial to the authority ORPort", got)
+	if got := stackRec.recorded(); len(got) != 1 || got[0] != "tcp 1.2.3.4:9001" {
+		t.Fatalf("LinkDialer dialed %v, want the relay via the stack", got)
 	}
-	if got := stackRec.recorded(); len(got) != 0 {
-		t.Fatalf("stack dialed %v, want none — the route outranks the stack", got)
+	if got := routeRec.recorded(); len(got) != 0 {
+		t.Fatalf("route dialed %v on the link path, want none", got)
+	}
+	conn, err = cfg.FetchOptions.Dialer(ctx, "tcp", "128.31.0.39:9231")
+	if err != nil {
+		t.Fatalf("FetchOptions.Dialer: %v", err)
+	}
+	_ = conn.Close()
+	if got := routeRec.recorded(); len(got) != 1 || got[0] != "tcp 128.31.0.39:9231" {
+		t.Fatalf("FetchOptions.Dialer dialed %v, want the authority via the route", got)
 	}
 
-	stackRec = &dialRecorder{}
-	d, viaRoute = engineLinkDialer(map[string]any{
-		pub.StackDialerKey: fakeStackDialer{stackRec},
+	// With a route injected the raw address is dropped (NewProvider zeroes it),
+	// so the fetch upstream is empty and the route dialer carries the fetch.
+	p.cfg.UpstreamProxy = ""
+	cfg = p.clientConfig(map[string]*directory.Router{}, d, 30*time.Second)
+	if cfg.UpstreamProxy != "" || cfg.FetchOptions.UpstreamProxy != "" {
+		t.Fatalf("route case: upstream must be empty on both planes, got link=%q fetch=%q", cfg.UpstreamProxy, cfg.FetchOptions.UpstreamProxy)
+	}
+}
+
+// TestGuardLinkRidesStackNotUpstream is the behavioral proof of the data-path
+// contract: against a real in-process mock guard, a client built the way the
+// provider builds it (stack LinkDialer, empty UpstreamProxy, a separate fetch
+// upstream) dials the guard relay THROUGH THE STACK dialer directly — the
+// injected upstream route is never touched, and no SOCKS5 hop is chained onto
+// the relay connection even though a raw upstream_proxy is configured.
+func TestGuardLinkRidesStackNotUpstream(t *testing.T) {
+	h, err := testharness.NewHarness(1)
+	if err != nil {
+		t.Fatalf("NewHarness: %v", err)
+	}
+	defer h.Close()
+
+	dir := make(map[string]*directory.Router)
+	for _, e := range h.AllEntries() {
+		r := &directory.Router{}
+		r.Nickname = e.Nickname
+		r.IDDigest = e.IDDigest
+		r.OnionKey = e.OnionKey
+		r.Address = e.Address
+		r.Flags = e.Flags
+		dir[fmt.Sprintf("%x", r.IDDigest[:])] = r
+	}
+	guardKey := fmt.Sprintf("%x", h.GuardEntry().IDDigest[:])
+	guardAddr := h.GuardEntry().Address
+
+	stackRec, routeRec := &dialRecorder{}, &dialRecorder{}
+	on := true
+	p := &Provider{cfg: providerConfig{
+		OutboundID:       "tor",
+		UpstreamProxy:    "127.0.0.1:7890", // configured, but must NOT reach the guard dial
+		VerifySignatures: &on,
+	}}
+	d := dialPlanes{
+		link:  recordingDialer{stackRec}.Dial, // delegates so the real TLS link handshake completes
+		fetch: fakeUpstreamDialer{routeRec}.DialUpstream,
+	}
+	cfg := p.clientConfig(dir, d, 15*time.Second)
+	cfg.Guard = dir[guardKey]
+	cfg.AllowPrivateAddresses = true
+	cfg.SocksAddr = "127.0.0.1:0"
+
+	ctx, cancel := context.WithTimeout(context.Background(), 20*time.Second)
+	defer cancel()
+	cli, err := torclient.New(ctx, cfg)
+	if err != nil {
+		t.Fatalf("torclient.New: %v", err)
+	}
+	runErr := make(chan error, 1)
+	go func() { runErr <- cli.Run(ctx) }()
+	for !cli.Connected() {
+		select {
+		case err := <-runErr:
+			t.Fatalf("Run exited before connecting: %v", err)
+		case <-time.After(20 * time.Millisecond):
+		}
+	}
+	cancel() // Run closes the guard link on ctx cancellation
+	<-runErr
+
+	found := false
+	for _, d := range stackRec.recorded() {
+		if d == "tcp "+guardAddr {
+			found = true
+		}
+	}
+	if !found {
+		t.Fatalf("stack dials %v, want a direct tcp dial to the guard %s", stackRec.recorded(), guardAddr)
+	}
+	if got := routeRec.recorded(); len(got) != 0 {
+		t.Fatalf("upstream route dialed %v, want none — the guard link must never ride the provider upstream", got)
+	}
+}
+
+// TestNewProviderRawUpstreamFetchOnly verifies the raw plugin-config
+// upstream_proxy still routes the directory fetches (roster discovery) when no
+// engine route is injected: the bootstrap dials the SOCKS5 upstream address
+// through the engine stack, and Status reports the raw upstream active with no
+// route. The guard link is unaffected (it never carries the upstream — see
+// TestGuardLinkRidesStackNotUpstream).
+func TestNewProviderRawUpstreamFetchOnly(t *testing.T) {
+	stackRec := &dialRecorder{}
+	p, err := NewProvider(map[string]any{
+		"upstream_proxy":        "127.0.0.1:7890",
+		"fetch_timeout_seconds": 1,
+		pub.StackDialerKey:      fakeStackDialer{stackRec},
 	})
-	if viaRoute {
-		t.Fatal("stack-only injection must not report a route")
+	if err != nil {
+		t.Fatalf("NewProvider: %v", err)
 	}
-	if _, err := d(ctx, "tcp", "128.31.0.39:9131"); err != nil {
-		t.Fatalf("dial through the stack: %v", err)
+	prov := p.(*Provider)
+	defer prov.Close()
+
+	if prov.cfg.UpstreamProxy != "127.0.0.1:7890" {
+		t.Fatalf("raw upstream_proxy = %q, want kept for the fetches", prov.cfg.UpstreamProxy)
 	}
-	if got := stackRec.recorded(); len(got) != 1 || got[0] != "tcp 128.31.0.39:9131" {
-		t.Fatalf("stack dialed %v, want one tcp dial to the authority ORPort", got)
+	if prov.viaRoute {
+		t.Fatal("no route injected, viaRoute must be false")
+	}
+	// The fetch dials the SOCKS5 upstream through the stack (the hop TO the
+	// proxy), observable on the recorder.
+	deadline := time.Now().Add(5 * time.Second)
+	for len(stackRec.recorded()) == 0 && time.Now().Before(deadline) {
+		time.Sleep(50 * time.Millisecond)
+	}
+	got := stackRec.recorded()
+	if len(got) == 0 {
+		t.Fatal("directory fetch never dialed through the engine stack")
+	}
+	if got[0] != "tcp 127.0.0.1:7890" {
+		t.Fatalf("first stack dial = %q, want the SOCKS5 upstream address (fetch-only upstream)", got[0])
+	}
+	st := prov.Status()
+	if st.Details["upstream_proxy"] != true {
+		t.Fatalf("Status upstream_proxy = %v, want true", st.Details["upstream_proxy"])
+	}
+	if st.Details["engine_route"] != false {
+		t.Fatalf("Status engine_route = %v, want false", st.Details["engine_route"])
 	}
 }
 
@@ -324,7 +533,7 @@ func TestOutboundsEmitRosterWhileConnecting(t *testing.T) {
 			t.Fatalf("outbound %q is not a per-exit pin (general outbound leaked while connecting)", o.ID)
 		}
 	}
-	if out[0].ID != "tor-list-relayA-aaaaaaaaaaaa" || out[1].ID != "tor-list-relayB-bbbbbbbbbbbb" {
+	if out[0].ID != "tor-list-relayA-aaaaaaaaaaaa-1.2.3.4:9001" || out[1].ID != "tor-list-relayB-bbbbbbbbbbbb-5.6.7.8:9002" {
 		t.Fatalf("per-exit outbounds unexpected: %q, %q", out[0].ID, out[1].ID)
 	}
 }
@@ -565,8 +774,8 @@ func TestOutboundsEmitPerExitRelays(t *testing.T) {
 	// Per-exit entries: id is provider id + nickname + digest prefix, config
 	// carries the full digest + display fields.
 	for i, want := range []struct{ id, digest, name, addr string }{
-		{"tor-list-relayA-aaaaaaaaaaaa", roster[0].IDDigest, "relayA", "1.2.3.4:9001"},
-		{"tor-list-relayB-bbbbbbbbbbbb", roster[1].IDDigest, "relayB", "5.6.7.8:9002"},
+		{"tor-list-relayA-aaaaaaaaaaaa-1.2.3.4:9001", roster[0].IDDigest, "relayA", "1.2.3.4:9001"},
+		{"tor-list-relayB-bbbbbbbbbbbb-5.6.7.8:9002", roster[1].IDDigest, "relayB", "5.6.7.8:9002"},
 	} {
 		got := out[1+i]
 		if got.ID != want.id || got.Protocol != "tor" {
@@ -583,6 +792,55 @@ func TestOutboundsEmitPerExitRelays(t *testing.T) {
 		}
 		if tunnel, _ := got.Config["tunnel"].(string); tunnel != "tor-list" {
 			t.Fatalf("outbound %s tunnel = %q, want tor-list (the general provider)", got.ID, tunnel)
+		}
+	}
+}
+
+// TestOutboundsExitIDsCarryAddress verifies every per-exit outbound id embeds
+// the relay's OR ip:port, and that the rare id collision is deduped with a
+// numeric suffix so the engine never sees duplicate ids. The general outbound
+// (no single server) keeps its plain id.
+func TestOutboundsExitIDsCarryAddress(t *testing.T) {
+	roster := []torclient.RouterInfo{
+		{Nickname: "relayA", IDDigest: strings.Repeat("a", 40), Address: "1.2.3.4:9001", IsExit: true},
+		{Nickname: "relayB", IDDigest: strings.Repeat("b", 40), Address: "5.6.7.8:9002", IsExit: true},
+		// Degenerate duplicate (same nickname, digest, address): exercises the
+		// collision suffix. The real directory keys by digest so this cannot
+		// happen live, but the guard keeps ids unique regardless.
+		{Nickname: "relayA", IDDigest: strings.Repeat("a", 40), Address: "1.2.3.4:9001", IsExit: true},
+	}
+	p := &Provider{
+		cfg:     providerConfig{OutboundID: "tor"},
+		watchCh: make(chan struct{}, 1),
+		stopped: make(chan struct{}),
+		client:  &fakeClient{exits: roster},
+	}
+	out, err := p.Outbounds(context.Background())
+	if err != nil {
+		t.Fatalf("Outbounds: %v", err)
+	}
+	if len(out) != 3 {
+		t.Fatalf("got %d outbounds, want 3", len(out))
+	}
+	want := []string{
+		"tor-relayA-aaaaaaaaaaaa-1.2.3.4:9001",
+		"tor-relayB-bbbbbbbbbbbb-5.6.7.8:9002",
+		"tor-relayA-aaaaaaaaaaaa-1.2.3.4:9001-2",
+	}
+	seen := map[string]bool{}
+	for i, o := range out {
+		if o.ID != want[i] {
+			t.Fatalf("out[%d].ID = %q, want %q", i, o.ID, want[i])
+		}
+		if seen[o.ID] {
+			t.Fatalf("duplicate outbound id %q", o.ID)
+		}
+		seen[o.ID] = true
+		if !strings.Contains(o.ID, roster[i].Address) {
+			t.Fatalf("id %q does not carry the relay address %q", o.ID, roster[i].Address)
+		}
+		if id, _ := o.Config["id"].(string); id != o.ID {
+			t.Fatalf("config id %q != outbound ID %q", id, o.ID)
 		}
 	}
 }
@@ -611,7 +869,7 @@ func TestPerExitOutboundDialPinsExit(t *testing.T) {
 	defer unregisterLiveProvider(p)
 
 	pinned, err := New(map[string]any{
-		"id":        "tor-pin-relayC-cccccccccccc",
+		"id":        "tor-pin-relayC-cccccccccccc-9.9.9.9:9003",
 		"tunnel":    "tor-pin",
 		"exit":      digest,
 		"exit_name": "relayC",

@@ -69,8 +69,8 @@ type Outbound struct {
 // provider-emitted {"id", "tunnel", "allow_private"} for the general
 // outbound, plus {"exit": <hex digest>, "exit_name": <nickname>} on
 // per-relay outbounds; the engine-injected "_dialer" key (StackDialer) is
-// intentionally ignored — the tor client's own connections already dial
-// through the engine stack via the provider.
+// intentionally ignored — the dial is an in-memory Tor circuit, not a socket,
+// and the client's guard link already rides the engine stack via the provider.
 func New(cfg map[string]any) (pub.Outbound, error) {
 	id, _ := cfg["id"].(string)
 	if id == "" {

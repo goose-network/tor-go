@@ -56,6 +56,13 @@ type Config struct {
 	// dials through to reach relays (e.g. "127.0.0.1:7890" for a local
 	// Clash/V2Ray instance). Empty means dial relays directly. This lets
 	// tor-go reach the Tor network from behind an upstream proxy.
+	//
+	// Embedders that want the upstream to carry ONLY the directory fetches
+	// (roster discovery) and not the relay dials — e.g. the goose provider,
+	// whose outbounds' data path must ride the engine stack — leave this
+	// empty and set FetchOptions.UpstreamProxy instead: the guard link then
+	// dials through LinkDialer (or direct) with no SOCKS5 hop, while the
+	// fetches and the consensus refresh ride the upstream.
 	UpstreamProxy string
 	// LinkDialer, when non-nil, establishes the raw TCP connection for
 	// every outbound hop of the client: the guard link, directory fetches,

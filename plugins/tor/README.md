@@ -28,25 +28,31 @@ module. On the goose side it imports only
 [`goose-plugin-api`](https://github.com/goose-network/goose-plugin-api) —
 never goose itself — so the plugin import boundary stays acyclic.
 
-## In-memory dials, engine-routed transport
+## In-memory dials, two transport planes
 
 The `"tor"` outbound protocol resolves the live provider (keyed by the
 outbound id, at dial time) and opens a circuit+stream through it. tor-go's
-own connections — the guard link's TCP, the directory fetches, fallback
-ORPorts — dial through **the engine**: when the provider spec's
-`upstream_proxy` names a goose route (`outbound:`/`pool:`/`chain:`), the
-injected route dialer (`goose-plugin-api`'s `UpstreamDialer`) is handed to
-tor-go as `Config.LinkDialer`, so every connection rides that
-outbound/pool/chain (whose own outermost hop rides the engine stack).
-Without a route, the engine's stack dialer (`StackDialer`) takes the slot —
-goose's layer-3/4 stack (system kernel or gvisor netstack).
+connections are split into two planes that ride different dialers:
 
-A plugin-config `upstream_proxy` address composes with the stack — the hop
-*to* the SOCKS5 upstream is dialed through the engine stack, and the SOCKS5
-tunnel to the relay runs on top — but is superseded by an injected route:
-the route already is the upstream proxy, and chaining a raw SOCKS5 hop
-inside it would double-proxy, so the address is dropped when a route is
-injected.
+- **Control plane — the directory fetches that discover the relay roster**
+  (consensus + microdescriptors from the authorities, fallback ORPorts, and
+  the hourly consensus refresh). These ride the provider's `upstream_proxy`:
+  when the spec names a goose route (`outbound:`/`pool:`/`chain:`), the
+  injected route dialer (`goose-plugin-api`'s `UpstreamDialer`) carries them;
+  otherwise the engine's stack dialer (`StackDialer`) carries the hop *to* the
+  config's raw SOCKS5 `upstream_proxy` address, and the SOCKS5 tunnel to the
+  authority runs on top. An injected route supersedes the raw address (the
+  route already is the upstream proxy; chaining a raw SOCKS5 hop inside it
+  would double-proxy), so the address is dropped when a route is injected.
+- **Data path — the guard link every circuit rides** (and thus every
+  outbound's relay traffic). This always rides the engine's stack dialer
+  (`StackDialer` — goose's layer-3/4 stack, system kernel or gvisor netstack),
+  or direct when none is injected. It **never** rides the provider
+  `upstream_proxy`, injected route or raw address alike: the upstream is for
+  fetching the server list only, not for the outbounds' own connections. To
+  route an outbound's data path through a proxy, set the separate
+  outbound-level `upstream_proxy` (resolved by the router), not the
+  provider's.
 
 Target policy matches the SOCKS5 server's (which mirrors the C client's
 `connection_edge.c`): `.onion` targets are refused (no hidden-service
@@ -74,7 +80,10 @@ background goroutine from the factory:
 - `Outbounds()` advertises **one outbound per Exit-flagged relay** as soon as
   the directory is fetched — independent of guard-link readiness, the tor
   analogue of psiphon's datastore server list — and adds the general `tor`
-  outbound once the client connects to its guard. Each change signals `Watch()`
+  outbound once the client connects to its guard. Per-exit ids are
+  `<outbound_id>-<nickname>-<digest-prefix>-<ip:port>`, so the id itself shows
+  the relay's OR address; the general outbound keeps the plain `<outbound_id>`
+  (it rides a live circuit, no single server). Each change signals `Watch()`
   so the engine repolls promptly instead of waiting for the 2-minute fallback
   poll.
 - A failed bootstrap (upstream down, authorities unreachable, no relays with
@@ -110,7 +119,7 @@ and `directory.FetchOptions` where they make sense as provider knobs:
 
 | Key | Default | Meaning |
 |---|---|---|
-| `upstream_proxy` | `""` (direct) | SOCKS5 proxy tor-go dials *through* to reach relays and directory authorities (e.g. a local Clash/V2Ray instance). The hop to the proxy still goes through the engine stack. Superseded (dropped) when the spec-level `upstream_proxy` names a goose route. |
+| `upstream_proxy` | `""` (direct) | SOCKS5 proxy tor-go dials *through* to reach the **directory authorities only** (roster discovery, e.g. a local Clash/V2Ray instance). The hop to the proxy still goes through the engine stack. Never routes the guard link / relay dials — those ride the engine stack. Superseded (dropped) when the spec-level `upstream_proxy` names a goose route. |
 | `path_len` | `3` | Circuit hops (guard / middle / exit). |
 | `outbound_id` | `"tor"` | The id of the outbound contributed to goose's pool; the outbound dials whichever live provider registered under this id. |
 | `fetch_timeout_seconds` | `300` | Timeout for the directory bootstrap (consensus + microdescriptor fetch). |
@@ -141,8 +150,8 @@ A minimal goose config using the provider:
 ```
 
 (Note the port semantics: `11080` is goose's inbound; `7890` is the upstream
-proxy tor-go dials through. There is no tor-go listener anymore — dials go
-straight from the engine to the embedded client in memory.)
+proxy tor-go dials through to fetch the directory. There is no tor-go listener
+anymore — dials go straight from the engine to the embedded client in memory.)
 
 ## Verifying it works
 
