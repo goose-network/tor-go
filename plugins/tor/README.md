@@ -45,14 +45,19 @@ connections are split into two planes that ride different dialers:
   route already is the upstream proxy; chaining a raw SOCKS5 hop inside it
   would double-proxy), so the address is dropped when a route is injected.
 - **Data path — the guard link every circuit rides** (and thus every
-  outbound's relay traffic). This always rides the engine's stack dialer
+  outbound's relay traffic). By default this rides the engine's stack dialer
   (`StackDialer` — goose's layer-3/4 stack, system kernel or gvisor netstack),
-  or direct when none is injected. It **never** rides the provider
-  `upstream_proxy`, injected route or raw address alike: the upstream is for
-  fetching the server list only, not for the outbounds' own connections. To
-  route an outbound's data path through a proxy, set the separate
-  outbound-level `upstream_proxy` (resolved by the router), not the
-  provider's.
+  or direct when none is injected, and **never** the provider
+  `upstream_proxy` (the fetch-only contract). The opt-in
+  `"link_via_upstream": true` config key, combined with a spec-level
+  `upstream_proxy` naming a goose route, additionally carries the guard link
+  through that same injected route dialer — which returns a completed
+  tunnel, so the guard TLS + v3 link handshake layer over it unchanged. This
+  is the openrung -> tor data path for hosts where direct guard dials are
+  blocked. The route must not contain the tor outbound itself (data-path
+  cycle). The separate outbound-level `upstream_proxy` (resolved by the
+  router) still routes an individual outbound's server connection; the tor
+  outbound has no server dial of its own.
 
 Target policy matches the SOCKS5 server's (which mirrors the C client's
 `connection_edge.c`): `.onion` targets are refused (no hidden-service
@@ -105,6 +110,7 @@ and `directory.FetchOptions` where they make sense as provider knobs:
 ```json
 {
   "upstream_proxy": "127.0.0.1:7890",
+  "link_via_upstream": false,
   "path_len": 3,
   "outbound_id": "tor",
   "fetch_timeout_seconds": 300,
@@ -112,6 +118,7 @@ and `directory.FetchOptions` where they make sense as provider knobs:
   "verify_signatures": true,
   "use_fallbacks": false,
   "link_dial_timeout_seconds": 45,
+  "link_idle_timeout_seconds": 0,
   "circuit_build_timeout_seconds": 90,
   "allow_private_addresses": false
 }
@@ -119,7 +126,8 @@ and `directory.FetchOptions` where they make sense as provider knobs:
 
 | Key | Default | Meaning |
 |---|---|---|
-| `upstream_proxy` | `""` (direct) | SOCKS5 proxy tor-go dials *through* to reach the **directory authorities only** (roster discovery, e.g. a local Clash/V2Ray instance). The hop to the proxy still goes through the engine stack. Never routes the guard link / relay dials — those ride the engine stack. Superseded (dropped) when the spec-level `upstream_proxy` names a goose route. |
+| `upstream_proxy` | `""` (direct) | SOCKS5 proxy tor-go dials *through* to reach the **directory authorities only** (roster discovery, e.g. a local Clash/V2Ray instance). The hop to the proxy still goes through the engine stack. By default it never routes the guard link / relay dials — those ride the engine stack (the `link_via_upstream` opt-in below is the guard-link exception). When the spec-level `upstream_proxy` names a goose route the raw address is dropped — **unless** `link_via_upstream` is also set, in which case it is kept and the directory fetches are decoupled onto the engine stack + this address so roster discovery does not ride the same tunnel as the guard link. |
+| `link_via_upstream` | `false` | Opt the **guard link** (the data path every circuit rides) into the spec-level injected upstream route too — openrung -> tor on hosts where direct guard dials are blocked. Requires a spec-level `upstream_proxy` naming a goose route (`outbound:`/`pool:`/`chain:`); no effect otherwise. The route dialer returns a completed tunnel; the guard TLS + v3 link handshake run over it unchanged. The route must not contain the tor outbound itself. |
 | `path_len` | `3` | Circuit hops (guard / middle / exit). |
 | `outbound_id` | `"tor"` | The id of the outbound contributed to goose's pool; the outbound dials whichever live provider registered under this id. |
 | `fetch_timeout_seconds` | `300` | Timeout for the directory bootstrap (consensus + microdescriptor fetch). |
@@ -127,6 +135,7 @@ and `directory.FetchOptions` where they make sense as provider knobs:
 | `verify_signatures` | `true` | Verify the v3 consensus signature quorum. Directory dirports serve plain HTTP, so the quorum is the only thing that authenticates the consensus — leave this on unless you know why not. |
 | `use_fallbacks` | `false` | Bootstrap over a CREATE_FAST one-hop fallback circuit instead of the authorities. The fallback path is unauthenticated, so it cannot be combined with `verify_signatures`. |
 | `link_dial_timeout_seconds` | `0` (client default) | Timeout for connecting to the guard. |
+| `link_idle_timeout_seconds` | `0` (120s) | Rolling first-byte read deadline on the guard link. On expiry the link is redialed only under sustained unanswered outbound (≥2 real cells since the last inbound, latest write younger than half the window) — a deaf-but-unclosed upstream tunnel; a healthy idle link is kept. |
 | `circuit_build_timeout_seconds` | `0` (client default) | Timeout for building a circuit. |
 | `allow_private_addresses` | `false` | Permit stream targets that are private/loopback/link-local (refused by default, mirroring the C client). |
 

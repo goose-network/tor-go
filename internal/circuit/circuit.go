@@ -15,6 +15,7 @@ import (
 	"fmt"
 	"net"
 	"sync"
+	"sync/atomic"
 	"time"
 
 	"github.com/goose-network/tor-go/internal/fast"
@@ -38,6 +39,37 @@ const (
 // handshake-type space (it has its own cell commands, CREATE_FAST/CREATED_FAST),
 // so this value is only ever compared against itself.
 const handshakeTypeFast uint16 = 0
+
+// ErrLinkDied is returned by circuit/stream awaits when the guard link's read
+// loop exits while they are waiting (peer close, upstream tunnel drop, or the
+// link's rolling idle deadline tripping on a deaf tunnel). It is distinct from
+// a build timeout or a DESTROY so the client can tell a dead guard link (redial
+// the link) apart from a bad middle/exit relay (retry a fresh path).
+var ErrLinkDied = errors.New("circuit: guard link died")
+
+// ErrCircuitClosed is returned by circuit/stream awaits when the circuit is torn
+// down while the guard link is still ALIVE — a remote relay DESTROY/TRUNCATED, a
+// deliver-window overrun, or a local Circuit.Close. Unlike ErrLinkDied it does
+// NOT implicate the link, so the client retries a fresh path WITHOUT striking or
+// redialing the healthy guard (which would sever every unrelated in-flight stream
+// multiplexed on it). closeAllStreams closes s.in for both cases; closedStreamErr
+// tells them apart by link liveness so a bad middle/exit cannot masquerade as link
+// death.
+var ErrCircuitClosed = errors.New("circuit: closed")
+
+// closedStreamErr classifies a closed s.in (closeAllStreams ran while an await was
+// blocked). The guard link dying surfaces ErrLinkDied (strike/redial the link); an
+// ordinary circuit teardown with the link still alive surfaces ErrCircuitClosed
+// (retry a fresh path, no strike). Reading link liveness here is race-tolerant: if
+// the link dies just after a teardown we may return ErrCircuitClosed, but the next
+// DialStream's liveLink sees IsAlive()==false and redials synchronously, so no
+// strike is lost — only deferred to the correct path.
+func (c *Circuit) closedStreamErr() error {
+	if c.link.IsAlive() {
+		return ErrCircuitClosed
+	}
+	return ErrLinkDied
+}
 
 // Flow-control window constants, matching src/core/or/or.h. The client tracks
 // two windows per circuit and per stream:
@@ -159,10 +191,14 @@ type Circuit struct {
 
 // Stream is an application stream multiplexed over a circuit.
 type Stream struct {
-	ID     uint16
-	circ   *Circuit
-	in     chan *torcell.RelayCell
-	closed bool
+	ID   uint16
+	circ *Circuit
+	in   chan *torcell.RelayCell
+	// closed is atomic because it is read by Read/Write/Close on the caller's
+	// goroutine while closeAllStreams (circuit readLoop, on link death or
+	// DESTROY) sets it under circ.mu. The channel close is what actually
+	// unblocks a pending Read; this flag is an advisory fast-path guard.
+	closed atomic.Bool
 
 	// BoundAddr is the address the exit bound the stream to, parsed from the
 	// RELAY_CONNECTED reply (an IPv4 or IPv6 literal). Empty until the stream
@@ -728,6 +764,8 @@ func (c *Circuit) awaitCell(ctx context.Context, command uint8) (*torcell.Cell, 
 				return nil, fmt.Errorf("circuit: destroyed (reason %d)", cell.Payload[0])
 			}
 			// Unexpected cell; keep waiting.
+		case <-c.link.Done():
+			return nil, ErrLinkDied
 		case <-time.After(time.Until(deadline)):
 			return nil, fmt.Errorf("circuit: timeout waiting for cell %d", command)
 		case <-ctx.Done():
@@ -761,6 +799,8 @@ func (c *Circuit) awaitRelay(ctx context.Context, command uint8) (*torcell.Relay
 				return rc, nil
 			}
 			// Other relay commands during building (e.g. padding) are ignored.
+		case <-c.link.Done():
+			return nil, ErrLinkDied
 		case <-time.After(time.Until(deadline)):
 			return nil, fmt.Errorf("circuit: timeout waiting for relay %d", command)
 		case <-ctx.Done():
@@ -810,6 +850,13 @@ func (c *Circuit) readLoop() {
 				continue
 			}
 			c.dispatchRelay(rc)
+		case <-c.link.Done():
+			// The guard link died (peer close, tunnel drop, idle-deadline trip).
+			// Nothing closes c.in on link death, so without this case readLoop
+			// would block on c.in forever and every Stream.Read would hang. Tear
+			// down the streams to unblock their readers, then exit.
+			c.closeAllStreams()
+			return
 		case <-c.done:
 			return
 		}
@@ -988,7 +1035,16 @@ func (c *Circuit) OpenStream(ctx context.Context, target string) (*Stream, error
 	}
 	for {
 		select {
-		case rc := <-s.in:
+		case rc, ok := <-s.in:
+			if !ok {
+				// closeAllStreams closed s.in (guard-link death OR a relay-side
+				// circuit teardown with the link still alive). A closed-channel
+				// receive yields a nil cell; never dereference it. Distinguish the
+				// two by link liveness so a bad middle/exit relay does not accrue a
+				// guard strike and redial a healthy link.
+				c.removeStream(id)
+				return nil, c.closedStreamErr()
+			}
 			if rc.Header.Command == torcell.RelayConnected {
 				s.BoundAddr = parseConnected(rc.Payload)
 				return s, nil
@@ -997,6 +1053,9 @@ func (c *Circuit) OpenStream(ctx context.Context, target string) (*Stream, error
 				c.removeStream(id)
 				return nil, endReasonToError(endReasonFromPayload(rc.Payload))
 			}
+		case <-c.link.Done():
+			c.removeStream(id)
+			return nil, ErrLinkDied
 		case <-time.After(time.Until(deadline)):
 			c.removeStream(id)
 			return nil, errors.New("circuit: stream connect timeout")
@@ -1009,7 +1068,7 @@ func (c *Circuit) OpenStream(ctx context.Context, target string) (*Stream, error
 
 // Write sends RELAY_DATA on the stream.
 func (s *Stream) Write(p []byte) (int, error) {
-	if s.closed {
+	if s.closed.Load() {
 		return 0, errors.New("stream: closed")
 	}
 	// Fragment into relay-payload-sized chunks.
@@ -1030,7 +1089,7 @@ func (s *Stream) Write(p []byte) (int, error) {
 // Read returns the next DATA payload received on the stream, or an error on
 // END.
 func (s *Stream) Read() ([]byte, error) {
-	if s.closed {
+	if s.closed.Load() {
 		return nil, errors.New("stream: closed")
 	}
 	rc, ok := <-s.in
@@ -1041,7 +1100,7 @@ func (s *Stream) Read() ([]byte, error) {
 	case torcell.RelayData:
 		return rc.Payload, nil
 	case torcell.RelayEnd:
-		s.closed = true
+		s.closed.Store(true)
 		// Map well-known END reasons to sentinel errors so the SOCKS5 layer
 		// can produce appropriate reply codes; EOF (DONE) is a normal close.
 		if err := endReasonToError(endReasonFromPayload(rc.Payload)); err != nil {
@@ -1057,10 +1116,9 @@ func (s *Stream) Read() ([]byte, error) {
 
 // Close sends a RELAY_END on the stream and removes it from the circuit.
 func (s *Stream) Close() error {
-	if s.closed {
+	if !s.closed.CompareAndSwap(false, true) {
 		return nil
 	}
-	s.closed = true
 	s.circ.removeStream(s.ID)
 	// Best-effort END with reason DONE (6); ignore errors. (Reason 0 is
 	// reserved/invalid in the spec.)
@@ -1142,7 +1200,11 @@ func (c *Circuit) BeginDir(ctx context.Context) (*Stream, error) {
 	}
 	for {
 		select {
-		case rc := <-s.in:
+		case rc, ok := <-s.in:
+			if !ok {
+				c.removeStream(id)
+				return nil, c.closedStreamErr()
+			}
 			if rc.Header.Command == torcell.RelayConnected {
 				s.BoundAddr = parseConnected(rc.Payload)
 				return s, nil
@@ -1151,6 +1213,9 @@ func (c *Circuit) BeginDir(ctx context.Context) (*Stream, error) {
 				c.removeStream(id)
 				return nil, endReasonToError(endReasonFromPayload(rc.Payload))
 			}
+		case <-c.link.Done():
+			c.removeStream(id)
+			return nil, ErrLinkDied
 		case <-time.After(time.Until(deadline)):
 			c.removeStream(id)
 			return nil, errors.New("circuit: begin_dir connect timeout")
@@ -1193,7 +1258,11 @@ func (c *Circuit) Resolve(ctx context.Context, hostname string) (string, error) 
 	}
 	for {
 		select {
-		case rc := <-s.in:
+		case rc, ok := <-s.in:
+			if !ok {
+				c.removeStream(id)
+				return "", c.closedStreamErr()
+			}
 			if rc.Header.Command == torcell.RelayResolved {
 				c.removeStream(id)
 				return parseResolved(rc.Payload)
@@ -1202,6 +1271,9 @@ func (c *Circuit) Resolve(ctx context.Context, hostname string) (string, error) 
 				c.removeStream(id)
 				return "", endReasonToError(endReasonFromPayload(rc.Payload))
 			}
+		case <-c.link.Done():
+			c.removeStream(id)
+			return "", ErrLinkDied
 		case <-time.After(time.Until(deadline)):
 			c.removeStream(id)
 			return "", errors.New("circuit: resolve timeout")
@@ -1255,14 +1327,16 @@ func (c *Circuit) removeStream(id uint16) {
 // tryDeliver hands a decrypted relay cell to a stream without blocking,
 // tolerating the stream having been removed (or the circuit torn down and
 // s.in closed) between the caller's map lookup and this send. Sending on a
-// closed channel would panic even inside a select, so re-check under the
-// circuit lock that the stream is still registered — closeAllStreams closes
-// s.in and empties the map in the same critical section, and removeStream
-// deletes without closing, so "still in the map" implies "channel open".
+// closed channel would panic even inside a select, so the registration
+// re-check AND the send both run under c.mu: closeAllStreams closes s.in and
+// empties the map in that same critical section, so holding the lock across
+// check-and-send makes them mutually exclusive — a sender either sees the
+// stream registered with an open channel, or gone, and never sends on a closed
+// channel. The send is non-blocking, so the lock is never held while waiting.
 func (c *Circuit) tryDeliver(s *Stream, rc *torcell.RelayCell) {
 	c.mu.Lock()
+	defer c.mu.Unlock()
 	current, ok := c.streams[s.ID]
-	c.mu.Unlock()
 	if !ok || current != s {
 		return
 	}
@@ -1273,18 +1347,19 @@ func (c *Circuit) tryDeliver(s *Stream, rc *torcell.RelayCell) {
 }
 
 // closeAllStreams closes every stream on the circuit. It runs from
-// Circuit.Close (the SOCKS-serving goroutine, racing the circuit's readLoop)
-// or from readLoop after a DESTROY. Closing s.in is safe against a racing
-// tryDeliver because both the close and the map-removal happen under the
-// same c.mu, and tryDeliver re-checks the stream is still registered under
-// that lock before sending — a sender either sees the stream in the map with
-// an open channel, or not in the map and skips the send. A DATA cell for a
-// stream that closeAllStreams removed is dropped with the stream.
+// Circuit.Close (the SOCKS-serving goroutine, racing the circuit's readLoop),
+// from readLoop after a DESTROY, or from readLoop on guard-link death. Closing
+// s.in is safe against a racing tryDeliver because the close and the
+// map-removal happen under the same c.mu that tryDeliver holds across BOTH its
+// registration re-check and its non-blocking send — a sender either sees the
+// stream in the map with an open channel, or not in the map and skips the send,
+// and the two can never interleave. A DATA cell for a stream that
+// closeAllStreams removed is dropped with the stream.
 func (c *Circuit) closeAllStreams() {
 	c.mu.Lock()
 	c.closed = true
 	for _, s := range c.streams {
-		s.closed = true
+		s.closed.Store(true)
 		close(s.in)
 	}
 	c.streams = nil

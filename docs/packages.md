@@ -483,9 +483,10 @@ directory over the network). Exactly one directory source must be chosen:
 
 **Purpose:** the goose proxy-pool engine's `tor` provider plugin. It embeds
 the client packages as a library, bootstraps a real Tor client (directory
-fetch, guard link, SOCKS5 listener) in a background goroutine with
-exponential-backoff retries, and contributes one `socks5` outbound at the
-client's loopback listener once it is serving; `Watch()` signals the
+fetch, guard link, per-stream circuits) in a background goroutine with
+exponential-backoff retries, and contributes the in-memory `tor` outbound set
+(general + per-exit) once the directory is fetched / the client is connected;
+no listener is ever bound. `Watch()` signals the
 readiness flip so the engine repolls promptly. The consensus is re-fetched
 hourly while serving. It lives inside this module (not a separate repo)
 because it embeds `internal/torclient` and `internal/directory`; on the goose
@@ -497,11 +498,14 @@ boundary.
 **Exported API:** `New(map[string]any) (plugin.Provider, error)` — registered
 as `"tor"` via `plugin.RegisterProvider` in `init()`.
 
-**Config keys:** `upstream_proxy`, `path_len`, `socks_listen` (default
-ephemeral), `outbound_id` (default `"tor"`), `fetch_timeout_seconds`
+**Config keys:** `upstream_proxy`, `link_via_upstream` (default false — opt
+the guard link into the injected upstream route, openrung -> tor), `path_len`,
+`outbound_id` (default `"tor"`), `fetch_timeout_seconds`
 (default 300), `max_microdescs`, `verify_signatures` (default **true** — the
 quorum is the only consensus authentication, since dirports are plain HTTP),
 `use_fallbacks` (incompatible with `verify_signatures`),
-`link_dial_timeout_seconds`, `circuit_build_timeout_seconds`,
+`link_dial_timeout_seconds`, `link_idle_timeout_seconds` (default 120 —
+rolling first-byte read deadline; expiry redials only under unanswered
+outbound load, i.e. a deaf upstream tunnel), `circuit_build_timeout_seconds`,
 `allow_private_addresses`. See `plugins/tor/README.md` for the full table
 and a goose config example.

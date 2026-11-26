@@ -15,9 +15,12 @@ import (
 	"encoding/binary"
 	"errors"
 	"fmt"
+	"io"
 	"log"
 	"net"
+	"os"
 	"sync"
+	"sync/atomic"
 	"time"
 
 	"github.com/goose-network/tor-go/internal/proxy"
@@ -73,7 +76,64 @@ type Link struct {
 	// mirroring channel_tls_process_netinfo_cell (channeltls.c:1962).
 	peerTimestamp time.Time
 	clockSkew     time.Duration
+
+	// writeMu serializes post-handshake cell writes so the per-write deadline
+	// below is associated with exactly one WriteCell. crypto/tls already emits
+	// each Write as one whole record, but concurrent Send/SendPadding calls
+	// would otherwise race on SetWriteDeadline (one clears the deadline another
+	// just set); the mutex makes the set/write/clear sequence atomic.
+	writeMu sync.Mutex
+
+	// lastRead is the unix-nano timestamp of the most recent inbound cell,
+	// refreshed by readLoop. keepAliveLoop reads it to detect a link that is
+	// still "alive" (readLoop running) but has gone silent under load.
+	lastRead atomic.Int64
+
+	// lastWrite is the unix-nano timestamp of the most recent real (non-padding)
+	// outbound cell, refreshed by Send. keepAliveLoop pairs it with lastRead to
+	// detect inbound silence UNDER LOAD only: a link we recently wrote circuit
+	// cells to but that has stopped answering is deaf, whereas a genuinely idle
+	// link (no recent Send) is left alone so it is not needlessly redialed.
+	lastWrite atomic.Int64
+
+	// writesSinceRead counts real (non-padding) outbound cells sent since the most
+	// recent inbound cell. writeCell increments it; readLoop resets it on every
+	// inbound cell. The rolling-deadline kill gate requires >= 2 (sustained
+	// unanswered load) so a SINGLE outstanding write — a slow origin's reply still
+	// pending, or a trailing RELAY_END/SENDME after the last DATA — is not mistaken
+	// for a deaf tunnel and used to reap a healthy idle or slow link.
+	writesSinceRead atomic.Int64
+
+	// idleTimeout (nanoseconds) is the rolling post-handshake read deadline:
+	// readLoop arms it before every ReadAny and refreshes it on each inbound
+	// cell, so a deaf-but-unclosed tunnel (an upstream proxy that black-holes
+	// the connection without sending FIN/RST) makes ReadAny time out, readLoop
+	// exit, done close, and IsAlive flip false — instead of hanging forever.
+	// Stored atomically so SetIdleTimeout can tune it after dial.
+	idleTimeout atomic.Int64
 }
+
+// defaultLinkIdleTimeout is the rolling read deadline applied to an established
+// link when the embedder does not override it. An active link refreshes it on
+// every inbound cell and never trips it. A deaf link under load (real cells sent,
+// nothing back) trips it and is redialed. A healthy IDLE link is never reaped by
+// this deadline alone: readLoop gates the kill on recent real outbound activity,
+// because Tor does not negotiate channel padding here — an idle link legitimately
+// receives nothing for long stretches and keep-alive padding elicits no reply.
+const defaultLinkIdleTimeout = 120 * time.Second
+
+// linkWriteTimeout bounds a single cell write. A black-holed tunnel whose TCP
+// send buffer fills would otherwise block Send forever; the deadline turns that
+// into a prompt write error the circuit can fail on.
+const linkWriteTimeout = 30 * time.Second
+
+// cellReadTimeout bounds finishing a cell once its first byte has arrived. The
+// rolling idle deadline applies ONLY to the wait for that first byte (so an idle
+// timeout fires at a cell boundary with zero bytes consumed); after the first
+// byte the rest of the cell reads under this generous bound. A timeout here means
+// the tunnel died mid-cell — partial bytes were consumed, so framing is unsafe and
+// readLoop KILLS the link (it never continues), avoiding an alive-but-desynced zombie.
+const cellReadTimeout = 30 * time.Second
 
 // RouterIdentity is the 20-byte SHA-1 identity digest of a relay, plus its
 // Curve25519 onion key, as advertised in the consensus. This is everything
@@ -163,6 +223,9 @@ func DialWithDialer(ctx context.Context, d proxy.Dialer, upstreamAddr, addr stri
 		circuits: make(map[uint32]chan *torcell.Cell),
 		done:     make(chan struct{}),
 	}
+	l.idleTimeout.Store(int64(defaultLinkIdleTimeout))
+	l.lastRead.Store(time.Now().UnixNano())
+	l.lastWrite.Store(time.Now().UnixNano())
 	if err := l.handshake(ctx); err != nil {
 		tlsConn.Close()
 		return nil, err
@@ -244,7 +307,17 @@ func (l *Link) handshake(ctx context.Context) error {
 	}
 
 	// 2. Read the server's VERSIONS cell and pick the highest common version.
+	//    Bound the read by the dial ctx like consumeHandshakeCells/awaitNetinfo:
+	//    the codec sets no deadlines itself, so a TLS-complete-but-silent peer
+	//    (a malicious or stalled upstream relay can produce one) would otherwise
+	//    hang dialGuard forever holding dialMu.
+	deadline, ok := ctx.Deadline()
+	if !ok {
+		deadline = time.Now().Add(30 * time.Second)
+	}
+	l.conn.SetReadDeadline(deadline)
 	vc, err := l.codec.ReadVarCell()
+	l.conn.SetReadDeadline(time.Time{})
 	if err != nil {
 		return fmt.Errorf("link: read versions: %w", err)
 	}
@@ -505,11 +578,79 @@ func pickVersion(payload []byte) (uint16, error) {
 	return best, nil
 }
 
+// isTimeoutErr reports whether err is a deadline expiry (as opposed to a real
+// connection error). A rolling-deadline timeout on a healthy idle link must not
+// be treated as death; see readLoop's gated silence handling.
+func isTimeoutErr(err error) bool {
+	if errors.Is(err, os.ErrDeadlineExceeded) {
+		return true
+	}
+	var ne net.Error
+	return errors.As(err, &ne) && ne.Timeout()
+}
+
 // readLoop continuously reads cells and dispatches them to the circuit
-// registered for the cell's CircID. It exits when the connection closes.
+// registered for the cell's CircID. It exits on a real connection error, or when
+// the wait for a cell's first byte exceeds the rolling idle deadline WHILE real
+// circuit cells are being sent unanswered (>= 2 since the last inbound) — that is
+// how a deaf-but-unclosed tunnel (an upstream proxy that silently black-holes the
+// connection) is detected: the first-byte read times out, the loop returns, done
+// closes, and IsAlive flips false so keepAliveLoop redials instead of waiting
+// forever. The idle deadline bounds ONLY the first byte; the rest of a cell reads
+// under a generous completion deadline whose expiry KILLS (partial bytes consumed,
+// framing unsafe), so a gated keep can never resume the unbuffered codec mid-cell
+// and desync framing. A healthy IDLE link (padding-only, no recent real Send) or a
+// link with a SINGLE outstanding write (slow reply, trailing RELAY_END) is NOT
+// reaped on inbound silence — relays drop unsolicited padding without reply, so
+// silence alone is ambiguous; the deadline is refreshed and the link kept,
+// mirroring keepAliveLoop's gated silence check.
 func (l *Link) readLoop() {
 	defer close(l.done)
 	for {
+		// Bound ONLY the wait for the first byte of the next cell with the rolling
+		// idle deadline. Once a byte arrives the cell is underway: finish it under a
+		// generous completion deadline, NOT the idle one. This guarantees an idle
+		// timeout fires only with ZERO cell bytes consumed, so the gated continue
+		// below can never discard a partially-read cell. The codec is unbuffered and
+		// go's TLS retains bytes across a Temporary() deadline timeout, so continuing
+		// mid-cell would read the continuation as a fresh header — an alive-but-
+		// unrecoverable framing desync that keepAlive never redials.
+		idle := time.Duration(l.idleTimeout.Load())
+		l.conn.SetReadDeadline(time.Now().Add(idle))
+		var first [1]byte
+		if _, err := io.ReadFull(l.conn, first[:]); err != nil {
+			if isTimeoutErr(err) {
+				// Zero cell bytes consumed: safe to keep a healthy link. Kill only on
+				// SUSTAINED unanswered outbound (deaf under load): >= 2 real cells since
+				// the last inbound AND a write young enough that a reply is overdue
+				// (younger than half the idle window). The recency window MUST be shorter
+				// than idle: the deadline fires idle after the last inbound, so every
+				// counted write is post-inbound and Since(LastWrite) < idle ALWAYS holds —
+				// a ">= idle" guard is dead code that reaps the ubiquitous END+DESTROY
+				// teardown pair (2 unanswered, response-less cells) on every quiet link.
+				// With idle/2, trailing teardown writes sent right after the last inbound
+				// have aged past idle/2 by the fire instant and are kept; only a link still
+				// being written into with no inbound (writeAge < idle/2) is deaf. A single
+				// outstanding cell (one CREATE2 mid-handshake, one trailing RELAY_END) is
+				// always kept (count < 2). A genuinely idle link (no real Send) is kept; a
+				// deaf idle link is caught when traffic resumes (first-hop strike).
+				if l.writesSinceRead.Load() < 2 || time.Since(l.LastWrite()) >= idle/2 {
+					continue
+				}
+			}
+			// A real connection error, OR sustained unanswered outbound (deaf under
+			// load): the link is dead. done closes, IsAlive flips false, and
+			// keepAliveLoop/liveLink redials instead of waiting forever.
+			l.mu.Lock()
+			l.err = err
+			l.mu.Unlock()
+			return
+		}
+		// First byte arrived: finish the cell without the idle deadline. A generous
+		// completion bound still catches a tunnel that dies mid-cell; such a timeout
+		// consumes partial bytes, so it KILLS (never continues) — framing is unsafe.
+		l.conn.SetReadDeadline(time.Now().Add(cellReadTimeout))
+		l.codec.PushBack(first[:])
 		msg, err := l.codec.ReadAny()
 		if err != nil {
 			l.mu.Lock()
@@ -517,6 +658,8 @@ func (l *Link) readLoop() {
 			l.mu.Unlock()
 			return
 		}
+		l.lastRead.Store(time.Now().UnixNano())
+		l.writesSinceRead.Store(0)
 		cell, ok := msg.(*torcell.Cell)
 		if !ok {
 			// Variable-length cells after handshake (e.g. padding). Ignore.
@@ -601,7 +744,7 @@ func (l *Link) Unregister(id uint32) {
 
 // Send writes a cell on the link.
 func (l *Link) Send(cell *torcell.Cell) error {
-	return l.codec.WriteCell(cell)
+	return l.writeCell(cell, true)
 }
 
 // SendPadding sends an unsolicited PADDING cell (command 0, zero payload).
@@ -612,7 +755,26 @@ func (l *Link) Send(cell *torcell.Cell) error {
 // (channelpadding.c); here it defeats idle-timeout reaping by upstream
 // SOCKS5 proxies such as Clash/mihomo that silently drop idle tunnels.
 func (l *Link) SendPadding() error {
-	return l.codec.WriteCell(&torcell.Cell{Command: torcell.CellPadding})
+	return l.writeCell(&torcell.Cell{Command: torcell.CellPadding}, false)
+}
+
+// writeCell serializes a post-handshake cell write under writeMu and bounds it
+// with a write deadline, so a black-holed tunnel whose send buffer fills fails
+// the write promptly instead of blocking the calling circuit forever. trackWrite
+// records the write in lastWrite for real circuit cells only — padding is
+// excluded so keepAliveLoop's inbound-silence check fires under load, not on an
+// idle link that is merely being padded.
+func (l *Link) writeCell(cell *torcell.Cell, trackWrite bool) error {
+	l.writeMu.Lock()
+	defer l.writeMu.Unlock()
+	l.conn.SetWriteDeadline(time.Now().Add(linkWriteTimeout))
+	err := l.codec.WriteCell(cell)
+	l.conn.SetWriteDeadline(time.Time{})
+	if err == nil && trackWrite {
+		l.lastWrite.Store(time.Now().UnixNano())
+		l.writesSinceRead.Add(1)
+	}
+	return err
 }
 
 // Protocol returns the negotiated link protocol version.
@@ -661,6 +823,40 @@ func (l *Link) IsAlive() bool {
 	default:
 		return true
 	}
+}
+
+// Done returns a channel closed when the link's read loop exits (peer close,
+// TLS error, upstream tunnel drop, or the rolling idle deadline tripping on a
+// deaf link). Circuit awaits select on it so a guard-link death fails every
+// in-flight circuit/stream promptly instead of burning the full build budget.
+func (l *Link) Done() <-chan struct{} { return l.done }
+
+// LastRead returns the time of the most recent inbound cell. keepAliveLoop
+// uses it to spot a link that is still alive but has gone silent under load.
+func (l *Link) LastRead() time.Time { return time.Unix(0, l.lastRead.Load()) }
+
+// LastWrite returns the time of the most recent real (non-padding) outbound
+// cell. keepAliveLoop pairs it with LastRead to gate the inbound-silence check
+// to links that are actually under load.
+func (l *Link) LastWrite() time.Time { return time.Unix(0, l.lastWrite.Load()) }
+
+// WritesSinceRead returns the number of real (non-padding) outbound cells sent
+// since the most recent inbound cell. It is the "sustained unanswered outbound"
+// signal: a single outstanding cell (one CREATE2 mid-handshake, or one trailing
+// RELAY_END) is NOT deaf, but >= 2 unanswered cells with no inbound is. Both the
+// readLoop rolling-deadline gate and keepAliveLoop's gated-silence check require
+// >= 2 so a healthy link resuming from idle with its first handshake cell is not
+// mistaken for a deaf tunnel and false-killed mid-build.
+func (l *Link) WritesSinceRead() int64 { return l.writesSinceRead.Load() }
+
+// SetIdleTimeout overrides the rolling post-handshake read deadline. A
+// non-positive d restores the default. The embedder calls it right after dial
+// to tune deaf-link detection versus idle-link redial churn.
+func (l *Link) SetIdleTimeout(d time.Duration) {
+	if d <= 0 {
+		d = defaultLinkIdleTimeout
+	}
+	l.idleTimeout.Store(int64(d))
 }
 
 // isZeroID reports whether id is the zero value ("no expected identity").

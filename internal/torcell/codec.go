@@ -19,6 +19,35 @@ var ErrShortCell = errors.New("torcell: short cell")
 type Codec struct {
 	rw     io.ReadWriter
 	circID int // 2 or 4
+	// pending holds bytes pushed back ahead of rw. Link.readLoop reads the first
+	// byte of a cell under the rolling idle deadline, then pushes it back here so
+	// ReadAny re-reads it as the start of the cell. This confines an idle timeout to
+	// a cell boundary (zero bytes consumed by the codec), so the link's gated
+	// continue can never discard a partially-read cell and desync framing. Only the
+	// single readLoop goroutine touches pending; WriteCell does not.
+	pending []byte
+}
+
+// PushBack prepends b to the read stream: subsequent reads consume b before rw.
+// Used by Link.readLoop to return a first byte it read under the idle deadline.
+func (c *Codec) PushBack(b []byte) {
+	c.pending = append(c.pending, b...)
+}
+
+// readFull fills buf like io.ReadFull but drains pushed-back bytes first, so a
+// pushed-back first byte is re-read as part of the cell rather than lost.
+func (c *Codec) readFull(buf []byte) (int, error) {
+	n := 0
+	if len(c.pending) > 0 {
+		k := copy(buf, c.pending)
+		c.pending = c.pending[k:]
+		n = k
+		if n == len(buf) {
+			return n, nil
+		}
+	}
+	m, err := io.ReadFull(c.rw, buf[n:])
+	return n + m, err
 }
 
 // NewCodec returns a Codec over rw using the given circuit-ID width (which
@@ -95,7 +124,7 @@ func (c *Codec) ReadAny() (interface{}, error) {
 	// Peek the command byte to decide. We read the header bytes we know we
 	// need in all cases, then branch.
 	hdr := make([]byte, c.circID+1)
-	if _, err := io.ReadFull(c.rw, hdr); err != nil {
+	if _, err := c.readFull(hdr); err != nil {
 		return nil, fmt.Errorf("torcell: read header: %w", err)
 	}
 	var circID uint32
@@ -109,13 +138,13 @@ func (c *Codec) ReadAny() (interface{}, error) {
 	if IsVariable(cmd) {
 		// Read 2-byte length then payload.
 		lenBuf := make([]byte, 2)
-		if _, err := io.ReadFull(c.rw, lenBuf); err != nil {
+		if _, err := c.readFull(lenBuf); err != nil {
 			return nil, fmt.Errorf("torcell: read varcell length: %w", err)
 		}
 		length := int(binary.BigEndian.Uint16(lenBuf))
 		payload := make([]byte, length)
 		if length > 0 {
-			if _, err := io.ReadFull(c.rw, payload); err != nil {
+			if _, err := c.readFull(payload); err != nil {
 				return nil, fmt.Errorf("torcell: read varcell payload: %w", err)
 			}
 		}
@@ -124,7 +153,7 @@ func (c *Codec) ReadAny() (interface{}, error) {
 
 	// Fixed cell: read the remaining payload.
 	cell := &Cell{CircID: circID, Command: cmd}
-	if _, err := io.ReadFull(c.rw, cell.Payload[:]); err != nil {
+	if _, err := c.readFull(cell.Payload[:]); err != nil {
 		return nil, fmt.Errorf("torcell: read cell payload: %w", err)
 	}
 	return cell, nil

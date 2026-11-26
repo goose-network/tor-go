@@ -123,12 +123,113 @@ func TestEngineDialerPlanes(t *testing.T) {
 	}
 }
 
+// TestResolvePlanesLinkViaUpstream verifies the opt-in link_via_upstream seam:
+// by default the guard link rides the stack and never the injected route (the
+// fetch-only contract); with the knob set AND a route injected, the guard link
+// rides the route dialer too (openrung -> tor); the knob is a no-op without a
+// route. The fetch plane always takes the route when injected, and the raw
+// fetch upstream_proxy address is dropped whenever a route supersedes it.
+func TestResolvePlanesLinkViaUpstream(t *testing.T) {
+	ctx, cancel := context.WithCancel(context.Background())
+	defer cancel()
+
+	// Default (knob unset): guard link on the stack, fetch on the route.
+	stackRec, routeRec := &dialRecorder{}, &dialRecorder{}
+	cfg := map[string]any{
+		pub.StackDialerKey:    fakeStackDialer{stackRec},
+		pub.UpstreamDialerKey: fakeUpstreamDialer{routeRec},
+	}
+	pc := providerConfig{UpstreamProxy: "127.0.0.1:7890"}
+	d, viaRoute := resolvePlanes(cfg, &pc)
+	if !viaRoute {
+		t.Fatal("injected route not reported")
+	}
+	if pc.UpstreamProxy != "" {
+		t.Fatalf("raw fetch upstream = %q, want dropped when a route supersedes it", pc.UpstreamProxy)
+	}
+	conn, err := d.link(ctx, "tcp", "1.2.3.4:9001")
+	if err != nil {
+		t.Fatalf("link dial: %v", err)
+	}
+	_ = conn.Close()
+	if got := stackRec.recorded(); len(got) != 1 || got[0] != "tcp 1.2.3.4:9001" {
+		t.Fatalf("default link dialed %v, want the relay via the stack", got)
+	}
+	if got := routeRec.recorded(); len(got) != 0 {
+		t.Fatalf("default link rode the route %v, want none — fetch-only contract", got)
+	}
+
+	// Opt-in (knob set + route injected): guard link rides the route dialer.
+	stackRec, routeRec = &dialRecorder{}, &dialRecorder{}
+	cfg = map[string]any{
+		pub.StackDialerKey:    fakeStackDialer{stackRec},
+		pub.UpstreamDialerKey: fakeUpstreamDialer{routeRec},
+	}
+	pc = providerConfig{LinkViaUpstream: true}
+	d, viaRoute = resolvePlanes(cfg, &pc)
+	if !viaRoute {
+		t.Fatal("injected route not reported (opt-in case)")
+	}
+	conn, err = d.link(ctx, "tcp", "1.2.3.4:9001")
+	if err != nil {
+		t.Fatalf("opt-in link dial: %v", err)
+	}
+	_ = conn.Close()
+	if got := routeRec.recorded(); len(got) != 1 || got[0] != "tcp 1.2.3.4:9001" {
+		t.Fatalf("opt-in link dialed %v, want the guard relay via the upstream route", got)
+	}
+	if got := stackRec.recorded(); len(got) != 0 {
+		t.Fatalf("opt-in link also rode the stack %v, want the route only", got)
+	}
+	// The fetch plane rides the same route dialer.
+	conn, err = d.fetch(ctx, "tcp", "128.31.0.39:9231")
+	if err != nil {
+		t.Fatalf("opt-in fetch dial: %v", err)
+	}
+	_ = conn.Close()
+	if got := routeRec.recorded(); len(got) != 2 || got[1] != "tcp 128.31.0.39:9231" {
+		t.Fatalf("opt-in fetch dialed %v, want the authority via the route", got)
+	}
+
+	// Knob set but NO route injected: no-op, guard link stays on the stack.
+	stackRec = &dialRecorder{}
+	cfg = map[string]any{pub.StackDialerKey: fakeStackDialer{stackRec}}
+	pc = providerConfig{LinkViaUpstream: true, UpstreamProxy: "127.0.0.1:7890"}
+	d, viaRoute = resolvePlanes(cfg, &pc)
+	if viaRoute {
+		t.Fatal("stack-only injection must not report a route")
+	}
+	if pc.UpstreamProxy != "127.0.0.1:7890" {
+		t.Fatalf("raw fetch upstream = %q, want kept when no route supersedes it", pc.UpstreamProxy)
+	}
+	conn, err = d.link(ctx, "tcp", "1.2.3.4:9001")
+	if err != nil {
+		t.Fatalf("no-route link dial: %v", err)
+	}
+	_ = conn.Close()
+	if got := stackRec.recorded(); len(got) != 1 || got[0] != "tcp 1.2.3.4:9001" {
+		t.Fatalf("no-route link dialed %v, want the relay via the stack (knob is a no-op)", got)
+	}
+}
+
 // recordingDialer records each dial then delegates to the system dialer, so a
 // real TLS/link handshake against the mock relay completes while the test
 // observes which dialer carried the connection.
 type recordingDialer struct{ rec *dialRecorder }
 
 func (d recordingDialer) Dial(ctx context.Context, network, address string) (net.Conn, error) {
+	d.rec.record(network, address)
+	var dl net.Dialer
+	return dl.DialContext(ctx, network, address)
+}
+
+// recordingRouteDialer is a pub.UpstreamDialer that records each dial then
+// delegates to the system dialer — the route seam behaves like goose's
+// routeDialer (a completed tunnel to the target) while the test observes
+// which plane rode it.
+type recordingRouteDialer struct{ rec *dialRecorder }
+
+func (d recordingRouteDialer) DialUpstream(ctx context.Context, network, address string) (net.Conn, error) {
 	d.rec.record(network, address)
 	var dl net.Dialer
 	return dl.DialContext(ctx, network, address)
@@ -267,6 +368,103 @@ func TestGuardLinkRidesStackNotUpstream(t *testing.T) {
 	}
 	if got := routeRec.recorded(); len(got) != 0 {
 		t.Fatalf("upstream route dialed %v, want none — the guard link must never ride the provider upstream", got)
+	}
+}
+
+// TestGuardLinkRidesRouteWhenOptedIn is the behavioral proof of the opt-in
+// openrung -> tor data path: with link_via_upstream set and a route injected,
+// the planes resolvePlanes builds carry the FULL guard TLS + v3 link
+// handshake (VERSIONS/CERTS-drain/NETINFO) against the in-process mock guard
+// through the ROUTE dialer — the stack dialer is never touched, and
+// Config.UpstreamProxy stays empty so no SOCKS5 hop is chained inside the
+// route and the fetchOpts refresh fallback cannot pick one up.
+func TestGuardLinkRidesRouteWhenOptedIn(t *testing.T) {
+	h, err := testharness.NewHarness(1)
+	if err != nil {
+		t.Fatalf("NewHarness: %v", err)
+	}
+	defer h.Close()
+
+	dir := make(map[string]*directory.Router)
+	for _, e := range h.AllEntries() {
+		r := &directory.Router{}
+		r.Nickname = e.Nickname
+		r.IDDigest = e.IDDigest
+		r.OnionKey = e.OnionKey
+		r.Address = e.Address
+		r.Flags = e.Flags
+		dir[fmt.Sprintf("%x", r.IDDigest[:])] = r
+	}
+	guardKey := fmt.Sprintf("%x", h.GuardEntry().IDDigest[:])
+	guardAddr := h.GuardEntry().Address
+
+	stackRec, routeRec := &dialRecorder{}, &dialRecorder{}
+	on := true
+	pc := providerConfig{OutboundID: "tor", LinkViaUpstream: true, VerifySignatures: &on}
+	d, viaRoute := resolvePlanes(map[string]any{
+		pub.StackDialerKey:    fakeStackDialer{stackRec},
+		pub.UpstreamDialerKey: recordingRouteDialer{routeRec},
+	}, &pc)
+	if !viaRoute {
+		t.Fatal("injected route not reported")
+	}
+	p := &Provider{cfg: pc}
+	cfg := p.clientConfig(dir, d, 15*time.Second)
+	cfg.Guard = dir[guardKey]
+	cfg.AllowPrivateAddresses = true
+	cfg.SocksAddr = "127.0.0.1:0"
+	if cfg.UpstreamProxy != "" || cfg.FetchOptions.UpstreamProxy != "" {
+		t.Fatalf("upstream must stay empty on both planes, got link=%q fetch=%q", cfg.UpstreamProxy, cfg.FetchOptions.UpstreamProxy)
+	}
+
+	ctx, cancel := context.WithTimeout(context.Background(), 20*time.Second)
+	defer cancel()
+	cli, err := torclient.New(ctx, cfg)
+	if err != nil {
+		t.Fatalf("torclient.New: %v", err)
+	}
+	runErr := make(chan error, 1)
+	go func() { runErr <- cli.Run(ctx) }()
+	for !cli.Connected() {
+		select {
+		case err := <-runErr:
+			t.Fatalf("Run exited before connecting: %v", err)
+		case <-time.After(20 * time.Millisecond):
+		}
+	}
+	cancel()
+	<-runErr
+
+	found := false
+	for _, d := range routeRec.recorded() {
+		if d == "tcp "+guardAddr {
+			found = true
+		}
+	}
+	if !found {
+		t.Fatalf("route dials %v, want the guard %s dialed through the injected route", routeRec.recorded(), guardAddr)
+	}
+	if got := stackRec.recorded(); len(got) != 0 {
+		t.Fatalf("stack dialed %v, want none — the opted-in guard link rides the route only", got)
+	}
+}
+
+// TestGuardAwaitWindow pins the derived await window: the FULL prop271 failover
+// budget (GuardConnectAttempts link dials) plus margin, floored at the legacy 15s.
+func TestGuardAwaitWindow(t *testing.T) {
+	for _, c := range []struct {
+		linkTimeout, want time.Duration
+	}{
+		{0, 15 * time.Second},
+		{1 * time.Second, 15 * time.Second},
+		{2 * time.Second, 15 * time.Second},
+		{3 * time.Second, 20 * time.Second},
+		{30 * time.Second, 155 * time.Second},
+		{45 * time.Second, 230 * time.Second},
+	} {
+		if got := guardAwaitWindow(c.linkTimeout); got != c.want {
+			t.Fatalf("guardAwaitWindow(%s) = %s, want %s", c.linkTimeout, got, c.want)
+		}
 	}
 }
 

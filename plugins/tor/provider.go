@@ -2,7 +2,7 @@
 // engine (github.com/goose-network/goose). It embeds tor-go — a from-scratch
 // Go Tor client — as a library and exposes it to goose the same way the
 // Psiphon provider embeds tunnel-core: the provider bootstraps a real Tor
-// client (directory fetch, guard link, circuit pool) in the background, and
+// client (directory fetch, guard link, per-stream circuits) in the background, and
 // once the client is connected it emits the goose outbound set — a general
 // "tor" outbound plus ONE outbound per Exit-flagged relay in the client's
 // directory (the tor analogue of the psiphon provider's per-server list), so
@@ -15,9 +15,12 @@
 // roster (the control plane) ride the provider's upstream_proxy — an injected
 // engine route (a goose outbound/pool/chain) when the spec names one, else the
 // config's raw SOCKS5 address over the engine stack — while the guard link
-// every circuit rides (the outbounds' data path) always rides the engine's
-// layer-3/4 stack, or direct when none is injected, NEVER the provider
-// upstream.
+// every circuit rides (the outbounds' data path) rides the engine's
+// layer-3/4 stack, or direct when none is injected, by default. The opt-in
+// link_via_upstream config key additionally routes the guard link through
+// the injected engine route (openrung -> tor) for hosts where direct guard
+// dials are blocked; without it the provider upstream never carries the
+// data path.
 //
 // This package lives inside the tor-go module (not a separate repo) because
 // it embeds tor-go's internal packages (internal/torclient, internal/directory),
@@ -48,7 +51,11 @@
 //	{
 //	  "upstream_proxy":           "127.0.0.1:7890",  // SOCKS5 for the directory/authority fetches ONLY
 //	                                                   // (roster discovery); never routes relay/circuit dials.
-//	                                                   // Superseded by a spec-level upstream_proxy naming a goose route
+//	                                                   // Dropped when a spec-level upstream_proxy names a goose
+//	                                                   // route — UNLESS link_via_upstream keeps it for decoupled
+//	                                                   // fetches (engine stack + this address, off the route)
+//	  "link_via_upstream":        false,             // opt the GUARD LINK into the spec-level injected route too
+//	                                                   // (openrung -> tor); no effect without an injected route
 //	  "path_len":                 3,                 // circuit hops (default 3)
 //	  "outbound_id":              "tor",             // goose outbound id (default "tor")
 //	  "fetch_timeout_seconds":    300,               // directory bootstrap timeout
@@ -58,6 +65,8 @@
 //	                                                   // could substitute the consensus)
 //	  "use_fallbacks":            false,              // CREATE_FAST fallback bootstrap
 //	  "link_dial_timeout_seconds":  45,               // guard TLS link timeout
+//	  "link_idle_timeout_seconds":  0,               // guard-link rolling read deadline (0 = 120s default);
+//	                                                   // expiry redials only under unanswered load (deaf tunnel)
 //	  "circuit_build_timeout_seconds": 90,           // per-circuit build timeout
 //	  "allow_private_addresses":  false              // allow private stream targets
 //	}
@@ -134,8 +143,9 @@ type Provider struct {
 	// viaRoute records that the engine injected an upstream-route dialer
 	// (the spec's upstream_proxy names a goose route), which carries the
 	// directory fetches in place of the stack dialer and the config's raw
-	// upstream_proxy address. The guard link always rides the stack, never the
-	// route. Surfaced through Status.
+	// upstream_proxy address. The guard link rides the stack by default; it
+	// rides the route too only when link_via_upstream opts in. Surfaced
+	// through Status.
 	viaRoute bool
 
 	// client is the running tor-go client, guarded by mu. It is non-nil from
@@ -178,7 +188,17 @@ type Provider struct {
 
 // providerConfig is the deserialized provider config map.
 type providerConfig struct {
-	UpstreamProxy              string `json:"upstream_proxy"`
+	UpstreamProxy string `json:"upstream_proxy"`
+	// LinkViaUpstream opts the GUARD LINK (the data path every circuit rides)
+	// into the same engine-injected upstream route as the directory fetches.
+	// Default false keeps the documented fetch-only contract: the guard link
+	// rides the engine stack / direct, never the route. Set true together with
+	// a spec-level upstream_proxy naming an openrung route (outbound:/pool:/
+	// chain:) to tunnel tor itself through that route — openrung -> tor — on
+	// hosts where direct guard dials are blocked. The route dialer returns a
+	// completed tunnel, so the guard TLS + link handshake layer over it
+	// unchanged. No effect unless a route is actually injected (viaRoute).
+	LinkViaUpstream            bool   `json:"link_via_upstream"`
 	PathLen                    int    `json:"path_len"`
 	OutboundID                 string `json:"outbound_id"`
 	FetchTimeoutSeconds        int    `json:"fetch_timeout_seconds"`
@@ -187,19 +207,35 @@ type providerConfig struct {
 	UseFallbacks               bool   `json:"use_fallbacks"`
 	LinkDialTimeoutSeconds     int    `json:"link_dial_timeout_seconds"`
 	CircuitBuildTimeoutSeconds int    `json:"circuit_build_timeout_seconds"`
-	AllowPrivateAddresses      bool   `json:"allow_private_addresses"`
+	// LinkIdleTimeoutSeconds is the guard link's rolling first-byte read
+	// deadline: on expiry the link is redialed only if real circuit cells are
+	// being sent unanswered (a deaf upstream tunnel); a healthy idle link is
+	// kept. Zero uses tor-go's generous default (120s).
+	LinkIdleTimeoutSeconds int  `json:"link_idle_timeout_seconds"`
+	AllowPrivateAddresses  bool `json:"allow_private_addresses"`
 }
 
-// engineStackDialer picks the dialer tor-go's guard link dials through — the
-// outbounds' data path: the engine's layer-3/4 stack dialer when injected,
+// engineStackDialer picks the DEFAULT dialer tor-go's guard link dials through
+// — the outbounds' data path: the engine's layer-3/4 stack dialer when injected,
 // else nil (tor-go's own system dialer). It deliberately never consults the
-// upstream route: the provider's upstream_proxy scopes the roster fetches
-// only, not the relay connection every circuit rides.
+// upstream route: the provider's upstream_proxy scopes the roster fetches only,
+// not the relay connection every circuit rides. resolvePlanes overrides this
+// default with the route dialer ONLY when the operator opts in via
+// link_via_upstream (see there); absent that knob the guard link stays on the
+// stack / direct, preserving the fetch-only contract.
 func engineStackDialer(cfg map[string]any) proxy.Dialer {
 	if sd := pub.AsStackDialer(cfg); sd != nil {
 		return sd.Dial
 	}
 	return nil
+}
+
+// systemDialer dials directly via the host network stack. It is the fetch-plane
+// fallback when no engine stack dialer was injected (route-only embedding), so a
+// decoupled directory fetch never falls back to the guard-link route dialer.
+func systemDialer(ctx context.Context, network, addr string) (net.Conn, error) {
+	var d net.Dialer
+	return d.DialContext(ctx, network, addr)
 }
 
 // engineFetchDialer picks the dialer tor-go's directory fetches ride — the
@@ -219,15 +255,79 @@ func engineFetchDialer(cfg map[string]any) (proxy.Dialer, bool) {
 	return nil, false
 }
 
-// dialPlanes carries the two connection planes NewProvider resolves from the
+// dialPlanes carries the two connection planes resolvePlanes builds from the
 // engine-injected dialers: link dials the guard connection every circuit rides
-// (the data path — engine stack or direct, never the provider upstream); fetch
-// dials the directory/authority connections that discover the roster (the
-// control plane — the injected upstream route, else the stack with the config's
-// raw upstream_proxy SOCKS5 hop on top).
+// (the data path — engine stack or direct by default, the injected upstream
+// route only when link_via_upstream opts in); fetch dials the directory/
+// authority connections that discover the roster (the control plane — the
+// injected upstream route, else the stack with the config's raw upstream_proxy
+// SOCKS5 hop on top).
 type dialPlanes struct {
 	link  proxy.Dialer
 	fetch proxy.Dialer
+}
+
+// resolvePlanes splits the engine-injected dialers by plane and applies the
+// opt-in link_via_upstream knob, mutating pc.UpstreamProxy when a route
+// supersedes the raw fetch address. By default the guard link (data path) rides
+// the engine stack or direct and NEVER the upstream route — the fetch-only
+// contract. When the spec's upstream_proxy names a goose route (viaRoute) AND
+// link_via_upstream is set, the guard link rides that same route dialer too:
+// DialUpstream returns a completed tunnel to the guard OR address, so tor-go's
+// TLS + v3 link handshake and every circuit multiplexed on the link layer over
+// it unchanged. This is what carries tor through openrung (openrung -> tor) on
+// a censored host where direct guard dials are blocked. The knob is a no-op
+// without an injected route, so upstream_proxy="" keeps the guard link direct.
+// When link_via_upstream is set AND a raw config upstream_proxy address is also
+// present, the fetch plane is decoupled: fetches ride the engine stack + that
+// raw SOCKS5 address while the guard link rides the route, so a deaf upstream
+// tunnel cannot stall roster discovery.
+func resolvePlanes(cfg map[string]any, pc *providerConfig) (dialPlanes, bool) {
+	d := dialPlanes{link: engineStackDialer(cfg)}
+	fetch, viaRoute := engineFetchDialer(cfg)
+	d.fetch = fetch
+	if viaRoute {
+		if pc.LinkViaUpstream {
+			// Opt-in: carry the guard link through the same route as the
+			// fetches. d.fetch is the route dialer (ud.DialUpstream) here,
+			// whose signature already matches proxy.Dialer.
+			d.link = fetch
+			if pc.UpstreamProxy != "" {
+				// Fetch decoupling: the operator supplied a raw SOCKS5 address
+				// (e.g. a local Clash) alongside link_via_upstream. Keep the
+				// directory/authority fetches on the engine stack + that raw
+				// address instead of the injected route, so the roster-discovery
+				// control plane does NOT ride the same upstream tunnel as the
+				// guard link — a deaf or slow openrung tunnel then cannot stall
+				// the consensus fetch (the partial-roster failure mode). The raw
+				// address only ever feeds FetchOptions; the link plane's
+				// Config.UpstreamProxy stays empty, so it never leaks onto a
+				// relay dial.
+				d.fetch = engineStackDialer(cfg)
+				if d.fetch == nil {
+					// Route-only embedding (no stack dialer injected). Never leave
+					// the fetch dialer nil: torclient.fetchOpts falls back to
+					// cfg.LinkDialer (the ROUTE) for a nil Dialer, which would
+					// re-couple the hourly consensus refresh to the upstream tunnel
+					// and chain the raw SOCKS5 address inside it. An explicit system
+					// dialer keeps decoupled fetches off the route.
+					d.fetch = systemDialer
+				}
+			} else {
+				// No raw address: fetches ride the route too. Drop the (empty)
+				// raw address so the fetchOpts fallback never chains a hop.
+				pc.UpstreamProxy = ""
+			}
+		} else {
+			// Fetch-only contract: the route supersedes the plugin config's raw
+			// upstream_proxy address for the fetches — tor-go would otherwise
+			// chain a SOCKS5 hop INSIDE the engine route (double-proxying through
+			// a raw address the operator probably meant to replace) — so the raw
+			// address is dropped and the route dials the authorities directly.
+			pc.UpstreamProxy = ""
+		}
+	}
+	return d, viaRoute
 }
 
 // NewProvider is the ProviderFactory registered as "tor". It parses the config and
@@ -254,22 +354,9 @@ func NewProvider(cfg map[string]any) (pub.Provider, error) {
 	// The engine injects its dialers into the config map: the stack dialer
 	// under pub.StackDialerKey, and — when the provider spec's
 	// upstream_proxy names a goose route (outbound:/pool:/chain:) — the
-	// route dialer under pub.UpstreamDialerKey. Split them by plane: the
-	// guard link (the outbounds' data path) rides the stack dialer or direct,
-	// never the upstream; the directory fetches that discover the roster ride
-	// the route when injected, else the stack with the config's raw
-	// upstream_proxy SOCKS5 address chained on top.
-	var viaRoute bool
-	d := dialPlanes{link: engineStackDialer(cfg)}
-	d.fetch, viaRoute = engineFetchDialer(cfg)
-	if viaRoute {
-		// The route supersedes the plugin config's raw upstream_proxy
-		// address for the fetches: tor-go would chain a SOCKS5 hop INSIDE
-		// the engine route (double-proxying through a raw address the
-		// operator probably meant to replace), so the raw address is dropped
-		// and the route dials the authorities directly.
-		pc.UpstreamProxy = ""
-	}
+	// route dialer under pub.UpstreamDialerKey. resolvePlanes splits them by
+	// plane and applies the opt-in link_via_upstream knob.
+	d, viaRoute := resolvePlanes(cfg, &pc)
 
 	p := &Provider{
 		cfg:      pc,
@@ -472,11 +559,26 @@ func (p *Provider) startOnce(ctx context.Context, d dialPlanes) error {
 	// 3. Run until cancelled: connect the guard, keep the link alive
 	//    (padding + self-healing redial), refresh the consensus hourly. A
 	//    Connect failure is returned immediately and retried by the caller.
+	//    Run rides a per-attempt ctx: an attempt abandoned by the await
+	//    window is cancelled and reaped, never left as a zombie client that
+	//    connects later and holds a guard tunnel (and an upstream-route
+	//    tunnel) nobody dials through.
+	runCtx, runCancel := context.WithCancel(ctx)
+	defer runCancel()
 	runErr := make(chan error, 1)
+	runDone := make(chan struct{})
 	go func() {
-		runErr <- cli.Run(ctx)
+		defer close(runDone)
+		runErr <- cli.Run(runCtx)
 	}()
-	if err := p.awaitConnected(ctx, cli, runErr, 15*time.Second); err != nil {
+	// The await window must cover the WHOLE prop271 failover sequence (up to
+	// GuardConnectAttempts guards, each its own LinkDialTimeout): a route-borne
+	// connect (link_via_upstream) failing over past deaf guards is slower than a
+	// LAN stack dial, and a window sized for one dial would reap it mid-sequence.
+	// torclient.New normalized tcfg.LinkDialTimeout (30s default).
+	if err := p.awaitConnected(ctx, cli, runErr, guardAwaitWindow(tcfg.LinkDialTimeout)); err != nil {
+		runCancel()
+		<-runDone // Run exits, closing any link it established; no zombie
 		p.clearClient()
 		return fmt.Errorf("guard connection: %w", err)
 	}
@@ -496,11 +598,14 @@ func (p *Provider) startOnce(ctx context.Context, d dialPlanes) error {
 }
 
 // clientConfig builds the tor-go client config for one bootstrap attempt. The
-// guard link — the outbounds' data path — rides d.link (the engine stack or
-// direct) with UpstreamProxy left empty, so no SOCKS5 hop is ever chained onto
-// a relay dial. The provider upstream is scoped to FetchOptions, which carries
-// the directory/authority fetches (the roster-discovery control plane) and the
-// hourly consensus refresh: the injected route dialer, else the stack with the
+// guard link — the outbounds' data path — rides d.link with UpstreamProxy left
+// empty, so no SOCKS5 hop is ever chained onto a relay dial. d.link is the
+// engine stack / direct by default, or the injected upstream route dialer when
+// link_via_upstream opted in (resolvePlanes): that dialer already returns a
+// completed tunnel, so the guard TLS + link handshake run over it directly. The
+// provider upstream is scoped to FetchOptions, which carries the directory/
+// authority fetches (the roster-discovery control plane) and the hourly
+// consensus refresh: the injected route dialer, else the stack with the
 // config's raw upstream_proxy address.
 func (p *Provider) clientConfig(dir map[string]*directory.Router, d dialPlanes, timeout time.Duration) *torclient.Config {
 	pc := p.cfg
@@ -517,6 +622,7 @@ func (p *Provider) clientConfig(dir map[string]*directory.Router, d dialPlanes, 
 		LinkDialer:            d.link,
 		LinkDialTimeout:       linkTimeout,
 		CircuitBuildTimeout:   circTimeout,
+		LinkIdleTimeout:       time.Duration(pc.LinkIdleTimeoutSeconds) * time.Second,
 		AllowPrivateAddresses: pc.AllowPrivateAddresses,
 		// Refresh the consensus hourly: the engine is a long-lived client
 		// and a microconsensus is valid ~3h; without a refresh, descriptor
@@ -570,6 +676,22 @@ func (p *Provider) awaitConnected(ctx context.Context, cli *torclient.Client, ru
 	return errors.New("timeout waiting for guard connection")
 }
 
+// guardAwaitWindow derives the awaitConnected window from the effective
+// guard-link dial timeout times the FULL prop271 failover budget, plus margin,
+// floored at the legacy 15s so fast LAN bootstraps keep their quick failure
+// detection. Connect tries up to torclient.GuardConnectAttempts distinct guards,
+// each bounded by its own LinkDialTimeout; a route-borne connect (link_via_upstream)
+// failing over past deaf guards can take the whole sequence, so a window sized for
+// only ONE dial would reap a slow-but-successful Connect mid-failover and orphan
+// the client (then re-fetch the directory and restart selection from scratch).
+func guardAwaitWindow(linkTimeout time.Duration) time.Duration {
+	w := time.Duration(torclient.GuardConnectAttempts)*linkTimeout + 5*time.Second
+	if w < 15*time.Second {
+		w = 15 * time.Second
+	}
+	return w
+}
+
 // setTerminal records a startup error and wakes the engine for one final
 // poll so Outbounds can surface it; setNotReady drops the outbound.
 func (p *Provider) setTerminal(err error) {
@@ -621,12 +743,19 @@ func (p *Provider) Status() pub.ProviderStatus {
 	if p.cfg.VerifySignatures != nil {
 		verify = *p.cfg.VerifySignatures
 	}
+	// Echo the effective path length: torclient.New normalizes an unset (0)
+	// PathLen to 3, so report 3 rather than the raw 0 the config carries.
+	pathLen := p.cfg.PathLen
+	if pathLen == 0 {
+		pathLen = 3
+	}
 	details := map[string]any{
-		"upstream_proxy":    p.cfg.UpstreamProxy != "", // raw SOCKS5 upstream for the directory fetches
-		"engine_route":      p.viaRoute,                // injected route carries the directory fetches; the guard link rides the stack
+		"upstream_proxy":    p.cfg.UpstreamProxy != "",           // raw SOCKS5 upstream for the directory fetches
+		"engine_route":      p.viaRoute,                          // injected route carries the directory fetches
+		"link_via_upstream": p.viaRoute && p.cfg.LinkViaUpstream, // guard link (data path) rides the injected route too
 		"verify_signatures": verify,
 		"use_fallbacks":     p.cfg.UseFallbacks,
-		"path_len":          p.cfg.PathLen,
+		"path_len":          pathLen,
 		"relays":            p.relays,
 		"exits_in_roster":   p.exitCount,
 	}

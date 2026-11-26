@@ -24,10 +24,11 @@ import (
 	"errors"
 	"fmt"
 	"io"
-	"strings"
 	"log"
 	"net"
+	"strings"
 	"sync"
+	"sync/atomic"
 	"time"
 
 	"github.com/goose-network/tor-go/internal/circuit"
@@ -63,6 +64,11 @@ type Config struct {
 	// empty and set FetchOptions.UpstreamProxy instead: the guard link then
 	// dials through LinkDialer (or direct) with no SOCKS5 hop, while the
 	// fetches and the consensus refresh ride the upstream.
+	//
+	// LinkDialer itself may be an engine route dialer returning a COMPLETED
+	// tunnel (the goose provider's opt-in link_via_upstream): the guard link
+	// then rides that route with no SOCKS5 hop, and this field stays empty so
+	// the fetchOpts fallback never chains a link-plane address onto fetches.
 	UpstreamProxy string
 	// LinkDialer, when non-nil, establishes the raw TCP connection for
 	// every outbound hop of the client: the guard link, directory fetches,
@@ -76,6 +82,15 @@ type Config struct {
 	LinkDialTimeout time.Duration
 	// CircuitBuildTimeout is the timeout for building a circuit.
 	CircuitBuildTimeout time.Duration
+	// LinkIdleTimeout is the rolling post-handshake read deadline on the guard
+	// link, bounding the wait for the next inbound cell. On expiry the link is
+	// killed only under sustained unanswered outbound (>= 2 real cells since
+	// the last inbound, most recent write younger than half the window) — a
+	// deaf-but-unclosed upstream tunnel (a proxy that black-holes the connection
+	// without FIN/RST) — and the client redials. A healthy idle link refreshes
+	// the deadline and is kept. Zero uses the link layer's generous default
+	// (120s).
+	LinkIdleTimeout time.Duration
 	// RefreshInterval is how often to re-fetch the consensus in the
 	// background while serving. If zero (the default), no background refresh
 	// runs and the client uses the directory it was constructed with for its
@@ -116,6 +131,12 @@ type Client struct {
 	// would otherwise both dial and clobber c.link, leaking the loser's TLS
 	// connection and its readLoop goroutine.
 	dialMu sync.Mutex
+	// linkStrikes counts consecutive link-suspect circuit/stream failures
+	// (timeouts or guard-link death, as opposed to a DESTROY from a bad relay).
+	// Reaching linkStrikeThreshold triggers a guard redial: an "alive" link that
+	// keeps timing out builds is deaf, and the rolling read deadline may not
+	// have tripped yet. Reset on any successful stream open or fresh connect.
+	linkStrikes atomic.Int32
 }
 
 // New validates the config and prepares the client. It does not connect to
@@ -218,13 +239,20 @@ func hexIDDigest(r *directory.Router) string {
 	return string(b)
 }
 
+// GuardConnectAttempts is the prop271 failover bound: when the client was not
+// pinned to a specific guard (Config.Guard nil), Connect tries up to this many
+// distinct guards, each bounded by its own LinkDialTimeout. The provider sizes
+// its bootstrap await window from this (guardAwaitWindow) so a route-borne
+// connect failing over past deaf guards is not reaped mid-sequence.
+const GuardConnectAttempts = 5
+
 // Connect dials the guard and completes the link handshake. It is called
 // automatically by Serve, but may be called explicitly to connect before
 // serving.
 //
 // When the client was not pinned to a specific guard (Config.Guard nil), the
 // prop271 guard manager drives selection: on a failed connection attempt the
-// guard is marked failed and the next guard is tried, up to a small number of
+// guard is marked failed and the next guard is tried, up to GuardConnectAttempts
 // attempts. A successful connection confirms the guard in the manager.
 func (c *Client) Connect(ctx context.Context) error {
 	// Single-flight: hold dialMu across the check-and-dial so a concurrent
@@ -234,6 +262,10 @@ func (c *Client) Connect(ctx context.Context) error {
 	c.dialMu.Lock()
 	defer c.dialMu.Unlock()
 	c.mu.Lock()
+	if c.closed {
+		c.mu.Unlock()
+		return errors.New("torclient: client closed")
+	}
 	if c.link != nil {
 		c.mu.Unlock()
 		return nil
@@ -249,9 +281,8 @@ func (c *Client) Connect(ctx context.Context) error {
 	// prop271 failover: try successive guards from the manager.
 	dir := c.directory()
 	eligible := eligibleGuards(dir)
-	const maxAttempts = 5
 	var lastErr error
-	for attempt := 0; attempt < maxAttempts; attempt++ {
+	for attempt := 0; attempt < GuardConnectAttempts; attempt++ {
 		sel := c.guards.PickForCircuit(eligible, time.Now())
 		if sel == nil {
 			break
@@ -271,7 +302,7 @@ func (c *Client) Connect(ctx context.Context) error {
 		log.Printf("torclient: guard %s (%s) failed: %v; trying next", r.Nickname, r.Address, err)
 	}
 	if lastErr != nil {
-		return fmt.Errorf("torclient: could not connect to any guard after %d attempts: %w", maxAttempts, lastErr)
+		return fmt.Errorf("torclient: could not connect to any guard after %d attempts: %w", GuardConnectAttempts, lastErr)
 	}
 	return errors.New("torclient: no guard available to connect")
 }
@@ -285,7 +316,25 @@ func (c *Client) dialGuard(ctx context.Context, r *directory.Router, guardID str
 	if err != nil {
 		return fmt.Errorf("connect to guard %s: %w", r.Address, err)
 	}
+	// Arm the rolling read deadline so a deaf upstream tunnel is detected and
+	// redialed rather than hanging the link forever (zero = link default).
+	l.SetIdleTimeout(c.cfg.LinkIdleTimeout)
 	c.mu.Lock()
+	if c.closed {
+		// The client shut down while this dial was in flight. Fix H's detached
+		// strike-redial runs on context.WithoutCancel, so it outlives both the
+		// failing request AND Run/Serve's ctx; without this re-check it would
+		// install a live guard link on a closed, reference-dropped client — an
+		// immortal zombie (readLoop goroutine + TLS conn + upstream-route tunnel)
+		// that nothing ever closes, since keepAliveLoop already exited and the
+		// idle gate keeps a quiet link alive forever. Shutdown holds c.mu to set
+		// closed and close c.link, so this check is mutually exclusive with it:
+		// either we install first (shutdown then closes the link) or shutdown
+		// wins here (we close the freshly dialed link and install nothing).
+		c.mu.Unlock()
+		l.Close()
+		return errors.New("torclient: client closed during guard dial")
+	}
 	c.link = l
 	// Record the dialed relay as the active guard so buildPath always
 	// handshakes with the identity of the relay the link actually goes to
@@ -293,12 +342,30 @@ func (c *Client) dialGuard(ctx context.Context, r *directory.Router, guardID str
 	// one New selected; hop 1's CREATE2 onionskin is keyed by c.guard).
 	c.guard = r
 	c.mu.Unlock()
+	c.linkStrikes.Store(0)
 	if guardID != "" {
 		c.guards.NoteConnectionSuccess(guardID, time.Now())
 	}
 	log.Printf("torclient: connected to guard %s (%s) link-proto=%d",
 		r.Nickname, r.Address, l.Protocol())
 	return nil
+}
+
+// deafUnderLoad reports whether a guard link is deaf under load: inbound-silent
+// past silenceThreshold while real outbound cells were sent within recentWriteWindow
+// AND at least 2 remain unanswered (writesSinceRead >= 2). It is a pure function of
+// the link's three measurements so the gate is unit-testable without a 60s live wait.
+//
+// The >= 2 guard is the fix for the idle-resume false-kill: silence is measured from
+// the last INBOUND cell and so includes the idle period BEFORE a fresh write. A
+// healthy link idle > silenceThreshold that resumes with a single CREATE2 has
+// writesSinceRead == 1, so it is NOT deaf — without the guard a keep-alive tick in
+// the [CREATE2, CREATED2] window would redial the healthy link mid-handshake and fail
+// the resuming probe. Only sustained unanswered outbound crosses >= 2. The writeAge
+// < recentWriteWindow clause additionally spares trailing teardown writes (END+
+// DESTROY) whose age has grown past the window by the time silence exceeds it.
+func deafUnderLoad(silent, writeAge time.Duration, writesSinceRead int64, silenceThreshold, recentWriteWindow time.Duration) bool {
+	return silent > silenceThreshold && writeAge < recentWriteWindow && writesSinceRead >= 2
 }
 
 // keepAliveLoop keeps the guard link from being reaped while the client is
@@ -319,7 +386,28 @@ func (c *Client) dialGuard(ctx context.Context, r *directory.Router, guardID str
 // The loop runs on a context derived from Serve's, so it stops when Serve
 // exits; it also gives up on a closed client.
 func (c *Client) keepAliveLoop(ctx context.Context) {
-	const keepAliveInterval = 60 * time.Second
+	// A short cadence so that once the link's rolling read deadline trips (or a
+	// write fails) on a deaf tunnel, the redial happens promptly instead of up
+	// to a minute later. The padding itself keeps idle tunnels from being reaped.
+	const keepAliveInterval = 20 * time.Second
+	// Inbound-silence thresholds: a link we wrote real circuit cells to within
+	// recentWriteWindow but that has answered nothing for silenceThreshold is
+	// deaf under load — redial it even though its read loop has not yet tripped
+	// the (longer) idle deadline. A genuinely idle link (no recent Send) is left
+	// alone, so padding-only quiet does not cause needless redial churn.
+	//
+	// The WritesSinceRead() >= 2 guard is essential: silence is measured from the
+	// last INBOUND cell, so it includes the idle period BEFORE a fresh write. A
+	// healthy link idle > silenceThreshold that resumes with a single CREATE2
+	// would otherwise look "silent under load" the instant a tick lands in the
+	// [CREATE2, CREATED2] window (~RTT wide) and be redialed mid-handshake — the
+	// resuming probe gets ErrLinkDied, its retry finds c.link nil mid-Connect and
+	// FAILS. Requiring >= 2 unanswered real cells spares that single outstanding
+	// handshake cell (and a single trailing RELAY_END); only sustained unanswered
+	// outbound (a deaf tunnel under real load) crosses it. This mirrors the
+	// readLoop rolling-deadline gate's count >= 2 protection.
+	const silenceThreshold = 60 * time.Second
+	const recentWriteWindow = 60 * time.Second
 	t := time.NewTicker(keepAliveInterval)
 	defer t.Stop()
 	for {
@@ -336,12 +424,27 @@ func (c *Client) keepAliveLoop(ctx context.Context) {
 			return
 		}
 		if l == nil || !l.IsAlive() {
-			c.redialGuard(ctx)
+			// Log it: this branch used to redial silently, hiding multi-minute
+			// outages. l == nil means a concurrent redialer is mid-Connect (no
+			// read loop exited); !IsAlive means the read loop exited (peer
+			// close, TLS error, tunnel drop, or the rolling idle deadline
+			// tripping on a deaf link).
+			if l == nil {
+				log.Printf("torclient: guard link absent (redial in progress); redialing")
+			} else {
+				log.Printf("torclient: guard link down (read loop exited); redialing")
+			}
+			c.redialGuard(ctx, l)
 			continue
 		}
 		if err := l.SendPadding(); err != nil {
 			log.Printf("torclient: guard link keep-alive failed: %v; redialing", err)
-			c.redialGuard(ctx)
+			c.redialGuard(ctx, l)
+			continue
+		}
+		if deafUnderLoad(time.Since(l.LastRead()), time.Since(l.LastWrite()), l.WritesSinceRead(), silenceThreshold, recentWriteWindow) {
+			log.Printf("torclient: guard link silent %s under recent load; redialing", time.Since(l.LastRead()).Round(time.Second))
+			c.redialGuard(ctx, l)
 		}
 	}
 }
@@ -350,13 +453,31 @@ func (c *Client) keepAliveLoop(ctx context.Context) {
 // provider's guard-failover machinery. It hops circuits onto the new link on
 // their next dial; in-flight circuits on the old link fail (their cells were
 // undeliverable anyway).
-func (c *Client) redialGuard(ctx context.Context) {
+//
+// observed is the link the caller saw dead/suspect. The tear-down is conditional
+// on identity: under concurrent probe load several callers (liveLink, the
+// keep-alive tick, and strike crossers) can race to redial the same dead link.
+// Without the identity check a loser whose swap lands AFTER a winner installed a
+// fresh link would Close() that healthy link, cascading into a redial storm. So
+// only nil+Close the link we actually observed; if c.link is already a different,
+// fresh link, leave it alone. Connect is single-flight (dialMu), so a redialer
+// that finds c.link nil (a winner mid-dial) still does not dial a second link.
+func (c *Client) redialGuard(ctx context.Context, observed *link.Link) {
 	c.mu.Lock()
-	old := c.link
+	if c.closed {
+		c.mu.Unlock()
+		return
+	}
+	cur := c.link
+	if cur != observed && cur != nil {
+		// A concurrent redialer already renewed the link; cur is fresh. Keep it.
+		c.mu.Unlock()
+		return
+	}
 	c.link = nil
 	c.mu.Unlock()
-	if old != nil {
-		old.Close()
+	if cur != nil {
+		cur.Close()
 	}
 	if err := c.Connect(ctx); err != nil {
 		log.Printf("torclient: guard redial failed: %v", err)
@@ -487,7 +608,7 @@ func (c *Client) ExitInfos() []RouterInfo {
 			Nickname: r.Nickname,
 			IDDigest: hexIDDigest(r),
 			Address:  r.Address,
-			IsExit:    true,
+			IsExit:   true,
 		})
 	}
 	return out
@@ -628,8 +749,70 @@ type dialer struct {
 // DialStream opens a Tor circuit and a stream to target. Each call builds a
 // new circuit; a production client would pool circuits, but per-stream
 // circuits give strong isolation and are simplest to reason about.
+//
+// A transient build/open failure (a DESTROY from a bad middle/exit relay, an
+// extend timeout) is retried with a FRESH path up to maxDialAttempts, sharing
+// the caller's ctx budget — so a single ~19% single-shot circuit failure does
+// not surface as a failed probe. Failures that look like a dead guard link
+// (timeouts against an "alive" link, or circuit.ErrLinkDied) also accrue a
+// strike; linkStrikeThreshold consecutive strikes redial the guard, escaping a
+// deaf tunnel faster than the rolling read deadline alone.
 func (d *dialer) DialStream(ctx context.Context, target string) (io.ReadWriteCloser, error) {
 	c := d.client
+	const maxDialAttempts = 3
+	var lastErr error
+	for attempt := 1; attempt <= maxDialAttempts; attempt++ {
+		if err := ctx.Err(); err != nil {
+			if lastErr != nil {
+				return nil, lastErr
+			}
+			return nil, err
+		}
+		l, err := c.liveLink(ctx)
+		if err != nil {
+			return nil, err
+		}
+		path, err := c.buildPath(d.pinnedExit)
+		if err != nil {
+			// Selection/lookup error (e.g. pinned exit left the directory):
+			// not transient, retrying the same selection cannot help.
+			return nil, err
+		}
+
+		bctx, cancel := context.WithTimeout(ctx, c.cfg.CircuitBuildTimeout)
+		circ, err := circuit.New(bctx, l, path)
+		cancel()
+		if err != nil {
+			lastErr = err
+			log.Printf("torclient: circuit build attempt %d/%d failed: %v", attempt, maxDialAttempts, err)
+			if isLinkSuspect(err) {
+				c.noteLinkStrike(ctx, l)
+			}
+			continue
+		}
+
+		sctx, scancel := context.WithTimeout(ctx, c.cfg.CircuitBuildTimeout)
+		stream, err := circ.OpenStream(sctx, target)
+		scancel()
+		if err != nil {
+			circ.Close()
+			lastErr = err
+			log.Printf("torclient: stream open attempt %d/%d failed: %v", attempt, maxDialAttempts, err)
+			if isLinkSuspect(err) {
+				c.noteLinkStrike(ctx, l)
+			}
+			continue
+		}
+		c.resetLinkStrikes()
+		return &streamWrap{stream: stream, circ: circ}, nil
+	}
+	return nil, lastErr
+}
+
+// liveLink returns the current guard link, redialing synchronously if it has
+// died while idle (see keepAliveLoop) so the request gets a fresh link instead
+// of failing on a write to a broken pipe.
+func (c *Client) liveLink(ctx context.Context) (*link.Link, error) {
 	c.mu.Lock()
 	l := c.link
 	c.mu.Unlock()
@@ -637,10 +820,7 @@ func (d *dialer) DialStream(ctx context.Context, target string) (io.ReadWriteClo
 		return nil, errors.New("torclient: not connected to guard")
 	}
 	if !l.IsAlive() {
-		// The tunnel died while we were idle (see keepAliveLoop). Redial
-		// synchronously so this request gets a fresh link instead of
-		// failing with a write to a broken pipe.
-		c.redialGuard(ctx)
+		c.redialGuard(ctx, l)
 		c.mu.Lock()
 		l = c.link
 		c.mu.Unlock()
@@ -648,27 +828,80 @@ func (d *dialer) DialStream(ctx context.Context, target string) (io.ReadWriteClo
 			return nil, errors.New("torclient: guard link lost and redial failed")
 		}
 	}
+	return l, nil
+}
 
-	path, err := c.buildPath(d.pinnedExit)
-	if err != nil {
-		return nil, err
-	}
+// linkStrikeThreshold is the number of consecutive link-suspect failures that
+// triggers a guard redial. It tolerates the occasional extend timeout (an
+// ordinary Tor failure) while still escaping a genuinely deaf link promptly.
+const linkStrikeThreshold = 3
 
-	bctx, cancel := context.WithTimeout(ctx, c.cfg.CircuitBuildTimeout)
-	defer cancel()
-	circ, err := circuit.New(bctx, l, path)
-	if err != nil {
-		return nil, err
+// noteLinkStrike records a link-suspect failure and, on reaching the threshold,
+// redials the guard. A CAS loop ensures exactly one goroutine crosses the
+// threshold per run (a bare Add(1)>=threshold fires for every concurrent crosser
+// at 3,4,5…, redialing repeatedly). The redial runs in the BACKGROUND on a context
+// detached from the failing request: a strike often fires exactly when the
+// request's budget expires, and redialing on that expired ctx would fail every
+// guard attempt instantly, leaving the client link-less until the next keep-alive
+// tick. observed is the link the failing dial used, so redialGuard's identity
+// check never closes a fresh link a concurrent redialer installed.
+func (c *Client) noteLinkStrike(ctx context.Context, observed *link.Link) {
+	for {
+		n := c.linkStrikes.Load()
+		if n >= linkStrikeThreshold {
+			return // another goroutine already crossed and is redialing
+		}
+		if !c.linkStrikes.CompareAndSwap(n, n+1) {
+			continue
+		}
+		if n+1 >= linkStrikeThreshold {
+			c.linkStrikes.Store(0)
+			log.Printf("torclient: %d consecutive link-suspect failures; redialing guard", linkStrikeThreshold)
+			go func() {
+				budget := time.Duration(GuardConnectAttempts)*c.cfg.LinkDialTimeout + 10*time.Second
+				rctx, cancel := context.WithTimeout(context.WithoutCancel(ctx), budget)
+				defer cancel()
+				c.redialGuard(rctx, observed)
+			}()
+		}
+		return
 	}
+}
 
-	sctx, scancel := context.WithTimeout(ctx, c.cfg.CircuitBuildTimeout)
-	stream, err := circ.OpenStream(sctx, target)
-	scancel()
-	if err != nil {
-		circ.Close()
-		return nil, err
+func (c *Client) resetLinkStrikes() { c.linkStrikes.Store(0) }
+
+// isLinkSuspect reports whether a circuit/stream failure points at a dead or
+// deaf guard link rather than a bad middle/exit relay or an unreachable
+// destination. Only link-suspect failures accrue a strike toward a guard redial;
+// relay/destination failures are retried with a fresh path but must NOT tear
+// down a healthy guard link (which would sever every unrelated in-flight stream
+// multiplexed on it).
+//
+// The discriminator is the circuit STAGE, not the timeout wording: a FIRST-HOP
+// failure ("circuit: first hop:" / "fast first hop:") means the guard itself
+// never completed CREATE2/CREATED2, so the link is unproven and a timeout there
+// implicates it. A later-hop extend timeout ("circuit: hop 2:" …) implicates a
+// bad middle relay, and a stream-connect timeout or caller-budget expiry during
+// OpenStream implicates the exit/destination — in all those cases the circuit
+// build already proved the guard bidirectionally alive, so they must not strike.
+// A truly deaf guard is independently caught by the rolling read deadline and
+// keepAliveLoop's gated silence check, so strikes only need the first-hop case.
+func isLinkSuspect(err error) bool {
+	if err == nil {
+		return false
 	}
-	return &streamWrap{stream: stream, circ: circ}, nil
+	if errors.Is(err, circuit.ErrLinkDied) {
+		return true
+	}
+	msg := err.Error()
+	if !strings.Contains(msg, "first hop:") {
+		return false
+	}
+	// First-hop failure: strike on a timeout (deaf guard), whether it surfaced as
+	// the await timer ("timeout waiting for") or the ctx deadline (both fire at
+	// the same instant and select picks either). A first-hop DESTROY or ntor/crypto
+	// error is a bad/wrong guard identity, handled by prop271 failover — not a strike.
+	return errors.Is(err, context.DeadlineExceeded) || strings.Contains(msg, "timeout waiting for")
 }
 
 // buildPath selects the relays for a circuit of the configured length.
@@ -733,14 +966,33 @@ func (c *Client) RouterCount() int {
 type streamWrap struct {
 	stream *circuit.Stream
 	circ   *circuit.Circuit
+	// residual holds the unread tail of the last DATA cell. A relay DATA payload
+	// can be larger than the caller's read buffer; copy(p, data) alone would
+	// silently drop the bytes past len(p), corrupting the stream. We buffer the
+	// remainder and drain it on subsequent Reads before pulling the next cell.
+	residual []byte
 }
 
 func (s *streamWrap) Read(p []byte) (int, error) {
-	data, err := s.stream.Read()
-	if err != nil {
-		return 0, err
+	if len(p) == 0 {
+		return 0, nil
 	}
-	n := copy(p, data)
+	// Pull cells until we have buffered bytes to hand back (skipping any empty
+	// DATA cell so we never return a spurious 0, nil).
+	for len(s.residual) == 0 {
+		data, err := s.stream.Read()
+		if err != nil {
+			// Translate the circuit's end-of-stream sentinel to io.EOF so
+			// io.Copy / HTTP body readers see a clean EOF, not an error.
+			if errors.Is(err, circuit.ErrEOF) {
+				return 0, io.EOF
+			}
+			return 0, err
+		}
+		s.residual = data
+	}
+	n := copy(p, s.residual)
+	s.residual = s.residual[n:]
 	return n, nil
 }
 
